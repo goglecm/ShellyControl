@@ -970,6 +970,7 @@ function computeReheatPlan() {
   let agileInMins = null;
   let agileBestSlot = null;
   let agileNextSlot = null;
+  let bestEndEpochMs = null;
   let agileDeadlineEpochMs = nowE + latestSafeStart * 60000;
   let diagFragments = [];
   let solarFresh = !isMetricStale("solar", CFG.stale.externalMs);
@@ -996,6 +997,7 @@ function computeReheatPlan() {
         return a.startEpochMs - b.startEpochMs;
       });
       solarSelected = solarEligible[0];
+      bestEndEpochMs = solarSelected.endEpochMs;
       solarInMins = Math.floor((solarSelected.startEpochMs - nowE) / 60000);
     }
   }
@@ -1026,7 +1028,14 @@ function computeReheatPlan() {
   plan.agileNextSlot = agileNextSlot;
 
   function decoratePlanNote() {
+    let showerSessionAgeMins = minutesSinceEpoch(S.session.startEpochMs);
+    let solarAgeMins = minutesSinceEpoch(S.solar.fetchedEpochMs);
+    let agileAgeMins = minutesSinceEpoch(S.agile.fetchedEpochMs);
     let summary = agileSummary(plan.agileBestSlot, plan.agileNextSlot);
+    if (S.session.active && showerSessionAgeMins !== null) diagFragments.push("session age " + showerSessionAgeMins + "m");
+    if (solarUsable && solarAgeMins !== null) diagFragments.push("solar age " + solarAgeMins + "m");
+    if (agileUsable && agileAgeMins !== null) diagFragments.push("agile age " + agileAgeMins + "m");
+    if (solarSelected && isEpochSane(bestEndEpochMs)) diagFragments.push("window end " + fmtHHMM(bestEndEpochMs));
     if (diagFragments.length > 0) plan.note = plan.note + " | " + diagFragments.join(",");
     if (summary) plan.note = plan.note + " | " + summary;
   }
@@ -1174,7 +1183,7 @@ function onHttp(result, error_code, error_message, userdata) {
   POLL.busy = false;
 
   if (error_code !== 0 || !result || result.code !== 200 || !result.body) {
-    errSet("http_" + userdata.name, "HTTP fail " + userdata.name + " (" + error_code + ")", 2);
+    errSet("http_" + userdata.name, "HTTP fail " + userdata.name + " (" + error_code + (error_message ? ": " + error_message : "") + ")", 2);
     return;
   }
 
@@ -1380,7 +1389,7 @@ function onKvsGetV1(result, error_code, error_message) {
   }
 
   if (error_code !== 0) {
-    errSet("kvs_get", "KVS.Get v1 failed (" + error_code + ")", 2);
+    errSet("kvs_get", "KVS.Get v1 failed (" + error_code + (error_message ? ": " + error_message : "") + ")", 2);
     setFullAtStatTemp();
     completeLoad();
     return;
@@ -1408,7 +1417,7 @@ function onKvsGetV2(result, error_code, error_message) {
   }
 
   if (error_code !== 0) {
-    errSet("kvs_get", "KVS.Get v2 failed (" + error_code + ")", 2);
+    errSet("kvs_get", "KVS.Get v2 failed (" + error_code + (error_message ? ": " + error_message : "") + ")", 2);
     setFullAtStatTemp();
     completeLoad();
     return;
@@ -1438,7 +1447,7 @@ function onKvsGetV3(result, error_code, error_message) {
   }
 
   if (error_code !== 0) {
-    errSet("kvs_get", "KVS.Get failed (" + error_code + ")", 2);
+    errSet("kvs_get", "KVS.Get failed (" + error_code + (error_message ? ": " + error_message : "") + ")", 2);
     setFullAtStatTemp();
     completeLoad();
     return;
