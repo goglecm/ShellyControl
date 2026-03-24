@@ -280,9 +280,7 @@ let S = {
   solar: {
     ok: false,
     fetchedEpochMs: 0,
-    bestStartEpochMs: 0,
-    bestEndEpochMs: 0,
-    bestScore: 0
+    candidates: []
   },
 
   agile: {
@@ -968,14 +966,30 @@ function computeReheatPlan() {
 
   let nowE = nowEpochMs();
   let solarInMins = null;
+  let solarSelected = null;
   let agileInMins = null;
   let agileBestSlot = null;
   let agileNextSlot = null;
   let agileDeadlineEpochMs = nowE + latestSafeStart * 60000;
 
-  if (CFG.solar.enabled && S.solar.ok && isEpochSane(S.solar.bestStartEpochMs)) {
-    let dt = S.solar.bestStartEpochMs - nowE;
-    if (dt >= 0) solarInMins = Math.floor(dt / 60000);
+  if (CFG.solar.enabled && S.solar.ok && S.solar.candidates && S.solar.candidates.length > 0) {
+    let solarEligible = [];
+    for (let i = 0; i < S.solar.candidates.length; i++) {
+      let c = S.solar.candidates[i];
+      if (!c || !isEpochSane(c.startEpochMs) || !isEpochSane(c.endEpochMs) || !isNum(c.avgScore)) continue;
+      if (c.startEpochMs < nowE) continue;
+      let dtMins = Math.floor((c.startEpochMs - nowE) / 60000);
+      if (dtMins <= latestSafeStart && dtMins <= CFG.planner.horizonMins) {
+        solarEligible.push(c);
+      }
+    }
+    if (solarEligible.length > 0) {
+      solarEligible.sort(function(a, b) {
+        return a.startEpochMs - b.startEpochMs;
+      });
+      solarSelected = solarEligible[0];
+      solarInMins = Math.floor((solarSelected.startEpochMs - nowE) / 60000);
+    }
   }
 
   if (CFG.agile.enabled && S.agile.ok && S.agile.slots.length > 0) {
@@ -1008,13 +1022,15 @@ function computeReheatPlan() {
     if (summary) plan.note = plan.note + " | " + summary;
   }
 
-  if (solarInMins !== null && solarInMins <= latestSafeStart && solarInMins <= CFG.planner.horizonMins) {
+  if (solarInMins !== null && solarSelected) {
     plan.nextReheatMins = solarInMins;
     plan.mode = "IMMERSION";
     plan.immMins = immMins;
     plan.reason = "SOLAR_WINDOW";
     plan.reasonDetail = "IMM " + immMins + "m";
-    plan.note = plan.reasonDetail + " [" + plan.reason + "]";
+    plan.note = plan.reasonDetail + " [" + plan.reason + "] SOLAR " +
+      fmtHHMM(solarSelected.startEpochMs) + "-" + fmtHHMM(solarSelected.endEpochMs) +
+      " score " + round2(solarSelected.avgScore);
     decoratePlanNote();
     S.plan = plan;
     return;
@@ -1093,17 +1109,19 @@ function parseSolarResponse(obj) {
   }
 
   let minLen = Math.max(1, CFG.solar.minWindowHours);
-  let bestStart = -1, bestEnd = -1, bestScore = 0;
+  let candidates = [];
 
   for (let i = 0; i <= n - minLen; i++) {
     for (let len = minLen; len <= Math.min(n - i, 8); len++) {
       let sum = 0;
       for (let j = 0; j < len; j++) sum += scores[i + j];
       let avg = sum / len;
-      if (avg >= CFG.solar.scoreThreshold && avg > bestScore) {
-        bestScore = avg;
-        bestStart = i;
-        bestEnd = i + len - 1;
+      if (avg >= CFG.solar.scoreThreshold) {
+        candidates.push({
+          startEpochMs: t[i] * 1000,
+          endEpochMs: t[i + len - 1] * 1000 + 3600000,
+          avgScore: round2(avg)
+        });
       }
     }
   }
@@ -1111,16 +1129,7 @@ function parseSolarResponse(obj) {
   S.solar.ok = true;
   S.solar.fetchedEpochMs = nowEpochMs();
 
-  if (bestStart < 0) {
-    S.solar.bestStartEpochMs = 0;
-    S.solar.bestEndEpochMs = 0;
-    S.solar.bestScore = 0;
-    return true;
-  }
-
-  S.solar.bestStartEpochMs = t[bestStart] * 1000;
-  S.solar.bestEndEpochMs = t[bestEnd] * 1000 + 3600000;
-  S.solar.bestScore = bestScore;
+  S.solar.candidates = candidates;
   return true;
 }
 
