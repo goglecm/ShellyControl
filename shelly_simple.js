@@ -72,12 +72,14 @@ let CFG = {
 };
 
 let V = {
-  health: Virtual.getHandle("text:220"),
-  fullnessPct: Virtual.getHandle("number:220"),
-  confidencePct: Virtual.getHandle("number:221"),
-  activity: Virtual.getHandle("text:221"),
-  nextReheatMins: Virtual.getHandle("number:222"),
-  plan: Virtual.getHandle("text:222")
+  tankPercent: Virtual.getHandle("number:200"),
+  confidencePct: Virtual.getHandle("number:201"),
+  nextReheatMins: Virtual.getHandle("number:202"),
+  minutes42: Virtual.getHandle("number:203"), // optional
+  health: Virtual.getHandle("text:200"),
+  activity: Virtual.getHandle("text:201"),
+  plan: Virtual.getHandle("text:202"),
+  tankState: Virtual.getHandle("text:203") // optional
 };
 
 let S = {
@@ -104,7 +106,7 @@ let S = {
     mode: "NONE",
     nextReheatMins: 0,
     agileCandidate: { status: "none", startEpochMs: 0, priceIncVat: null },
-    solarCandidate: { status: "none", startEpochMs: 0 }
+    solarCandidate: { status: "none", startEpochMs: 0, endEpochMs: 0 }
   },
 
   errorSummary: "OK"
@@ -429,7 +431,8 @@ function computePlan() {
     },
     solarCandidate: {
       status: solar.status,
-      startEpochMs: solar.next ? solar.next.startEpochMs : 0
+      startEpochMs: solar.next ? solar.next.startEpochMs : 0,
+      endEpochMs: solar.next ? solar.next.endEpochMs : 0
     }
   };
 }
@@ -451,11 +454,21 @@ function activityText() {
   return "IDLE";
 }
 
+function tankStateText(mins42) {
+  if (mins42 < CFG.urgentMins42) return "LOW";
+  if (mins42 < CFG.targetMins42) return "RECOVERING";
+  return "READY";
+}
+
 function planText() {
   let a = S.plan.agileCandidate;
   let s = S.plan.solarCandidate;
-  let agileInfo = "agile=" + a.status + "," + fmtHHMM(a.startEpochMs) + "," + fmtPkwh(a.priceIncVat);
-  let solarInfo = "solar=" + s.status + "," + fmtHHMM(s.startEpochMs);
+  let agileInfo = "agile=" + a.status + "@" + fmtHHMM(a.startEpochMs) + "," + fmtPkwh(a.priceIncVat);
+  let solarInfo = "solar=" + s.status + "@" + fmtHHMM(s.startEpochMs);
+  if (isNum(s.endEpochMs) && s.endEpochMs > 0) {
+    let withEnd = solarInfo + "-" + fmtHHMM(s.endEpochMs);
+    if (withEnd.length <= 32) solarInfo = withEnd;
+  }
   return "reason=" + S.plan.reason + "; action=" + S.plan.mode + "; " + agileInfo + "; " + solarInfo;
 }
 
@@ -470,13 +483,17 @@ function healthText() {
 function refreshVirtuals() {
   let fullKwh = energyAtStatKwh();
   let pct = fullKwh > 0 ? (S.energyKwh / fullKwh) * 100 : 0;
+  let mins42 = minutesAt42FromEnergy(S.energyKwh);
+  let nextReheat = clamp(round0(S.plan.nextReheatMins), 0, 1000000);
 
   if (V.health) V.health.setValue(healthText());
-  if (V.fullnessPct) V.fullnessPct.setValue(round1(clamp(pct, 0, 100)));
+  if (V.tankPercent) V.tankPercent.setValue(round1(clamp(pct, 0, 100)));
   if (V.confidencePct) V.confidencePct.setValue(confidencePct());
   if (V.activity) V.activity.setValue(activityText());
-  if (V.nextReheatMins) V.nextReheatMins.setValue(S.plan.nextReheatMins);
+  if (V.nextReheatMins) V.nextReheatMins.setValue(nextReheat);
+  if (V.minutes42) V.minutes42.setValue(Math.max(0, round1(mins42)));
   if (V.plan) V.plan.setValue(planText());
+  if (V.tankState) V.tankState.setValue(tankStateText(mins42));
 }
 
 function tick() {
