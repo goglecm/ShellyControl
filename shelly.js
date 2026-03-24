@@ -874,9 +874,42 @@ function computeConfidence() {
 }
 
 function planText() {
-  if (!S.plan || S.plan.mode === "NONE") return "HOLD";
-  if (S.plan.nextReheatMins <= 0) return "NOW " + S.plan.note;
-  return "IN " + S.plan.nextReheatMins + "m " + S.plan.note;
+  function compact(s, maxLen) {
+    if (!s) return "";
+    if (s.length <= maxLen) return s;
+    if (maxLen <= 1) return s.slice(0, maxLen);
+    return s.slice(0, maxLen - 1) + "…";
+  }
+
+  function fmtAgileCandidate(c) {
+    if (!c) return "next agile none";
+    if (c.status === "stale") return "next agile stale";
+    if (c.status === "none") return "next agile none";
+    if (c.status === "ok") return "next agile " + c.startHHMM + " " + c.priceText;
+    return "next agile none";
+  }
+
+  function fmtSolarCandidate(c) {
+    if (!c) return "next solar none";
+    if (c.status === "stale") return "next solar stale";
+    if (c.status === "none") return "next solar none";
+    if (c.status === "ok") return "next solar " + c.startHHMM + "-" + c.endHHMM;
+    return "next solar none";
+  }
+
+  let base = "HOLD";
+  if (S.plan && S.plan.mode !== "NONE") {
+    let coreNote = S.plan.note || "HOLD";
+    let pipeIx = coreNote.indexOf(" | ");
+    if (pipeIx >= 0) coreNote = coreNote.slice(0, pipeIx);
+    coreNote = compact(coreNote, 28);
+    if (S.plan.nextReheatMins <= 0) base = "NOW " + coreNote;
+    else base = "IN " + S.plan.nextReheatMins + "m " + coreNote;
+  }
+
+  let agileTxt = fmtAgileCandidate(S.plan ? S.plan.nextAgileCandidate : null);
+  let solarTxt = fmtSolarCandidate(S.plan ? S.plan.nextSolarCandidate : null);
+  return compact(base + " | " + agileTxt + " | " + solarTxt, 110);
 }
 
 function refreshVirtuals() {
@@ -934,7 +967,9 @@ function computeReheatPlan() {
     reasonDetail: "HOLD",
     note: "HOLD",
     agileBestSlot: null,
-    agileNextSlot: null
+    agileNextSlot: null,
+    nextAgileCandidate: { status: "none" },
+    nextSolarCandidate: { status: "none" }
   };
 
   if (planKwh <= 0.05) {
@@ -1001,6 +1036,17 @@ function computeReheatPlan() {
       solarInMins = Math.floor((solarSelected.startEpochMs - nowE) / 60000);
     }
   }
+  if (CFG.solar.enabled && !solarFresh) {
+    plan.nextSolarCandidate = { status: "stale" };
+  } else if (solarSelected) {
+    plan.nextSolarCandidate = {
+      status: "ok",
+      startHHMM: fmtHHMM(solarSelected.startEpochMs),
+      endHHMM: fmtHHMM(solarSelected.endEpochMs)
+    };
+  } else {
+    plan.nextSolarCandidate = { status: "none" };
+  }
 
   if (agileUsable && S.agile.slots.length > 0) {
     for (let i = 0; i < S.agile.slots.length; i++) {
@@ -1022,6 +1068,17 @@ function computeReheatPlan() {
       }
     }
     if (agileBestSlot) agileInMins = Math.floor((agileBestSlot.fromEpochMs - nowE) / 60000);
+  }
+  if (CFG.agile.enabled && !agileFresh) {
+    plan.nextAgileCandidate = { status: "stale" };
+  } else if (agileNextSlot && isNum(agileNextSlot.priceIncVat)) {
+    plan.nextAgileCandidate = {
+      status: "ok",
+      startHHMM: fmtHHMM(agileNextSlot.fromEpochMs),
+      priceText: fmtPence(agileNextSlot.priceIncVat)
+    };
+  } else {
+    plan.nextAgileCandidate = { status: "none" };
   }
 
   plan.agileBestSlot = agileBestSlot;
