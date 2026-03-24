@@ -1,42 +1,30 @@
+// PART 1 OF 4
 // =====================================================
-// SHELLY VIRTUAL DHW TANK - CLEAN UI + SELF-LEARNING + PERSISTENT
-// =====================================================
-// Visible dashboard:
-// - DHW kWh
-// - Tank %
-// - Litres @42C
-// - Minutes @42C
-// - Confidence %
-// - Minutes Since Full
-// - HP Learned kW
-// - Cal Err kWh
-// - State
-// - Mode
-//
-// Internal model still uses:
-// - feed temperature
-// - top pipe temperature
-// - HP power
-// - immersion power
-// - shower power
+// SHELLY VIRTUAL DHW TANK MODEL v3
+// - Restart-safe: persists energy + timestamps, applies offline standing losses
+// - 10 virtual devices total
+// - Robust error registry + Health virtual device
+// - Tap draw detection via top pipe temperature rise (when no shower)
+// - Reheat recommendation using reserve + optional solar / Agile timing
+// - Cheveley, Newmarket solar location + Octopus Agile endpoint support
 // =====================================================
 
 // --------------------
 // CONFIG
 // --------------------
 let CFG = {
+  // --- Tank model ---
   tankLitres: 114,
-  statTempC: 55,            // set to 50 or 55
+  statTempC: 55,
   maxTankTempC: 65,
 
   showerOutTempC: 42,
   showerLpm: 7.2,
 
-  // Cold inlet:
-  // "fixed" or "monthmap"
+  // Cold inlet: "fixed" or "monthmap"
   coldMode: "fixed",
   coldFixedC: 5,
-  coldByMonthC: [5, 5, 6, 8, 11, 14, 16, 16, 13, 10, 7, 5], // Jan..Dec
+  coldByMonthC: [5, 5, 6, 8, 11, 14, 16, 16, 13, 10, 7, 5],
 
   // Shower detection hysteresis
   showerOnW: 100,
@@ -48,12 +36,10 @@ let CFG = {
 
   // Charging assumptions / thresholds
   immersionKW: 3.0,
-  hpChargeKW: 2.2,          // initial learned value
+  hpChargeKW: 2.2,
   minUsefulFeedC: 30,
 
-  // Immersion thermostat inference:
-  // if immersion relay is enabled but measured power stays below this threshold
-  // for this long, infer top of tank = 65 C
+  // Immersion thermostat inference
   immersionLowPowerW: 50,
   immersionLowPowerHoldMs: 30000,
 
@@ -63,17 +49,10 @@ let CFG = {
   immersionToUpperFrac: 1.0,
 
   // Shower session grouping
-  showerSessionGapMs: 300000,          // 5 min between bursts = same shower
-  reliableTopAfterRunMs: 240000,       // 4 min running water => top pipe trusted
+  showerSessionGapMs: 300000,
+  reliableTopAfterRunMs: 240000,
 
-  // Learned behavior windows
-  historyDays: 14,
-  morningStartHour: 6.5,    // 06:30
-  morningEndHour: 9.5,      // 09:30
-  eveningStartHour: 17.5,   // 17:30
-  eveningEndHour: 22.0,     // 22:00
-
-  // Standing loss after one extra 12 mm wrap over top ~90%
+  // Standing loss table
   standingLoss: [
     { c: 45, kwhDay: 1.24 },
     { c: 50, kwhDay: 1.49 },
@@ -81,114 +60,152 @@ let CFG = {
     { c: 65, kwhDay: 2.23 }
   ],
 
-  // Learning rates and clamps
+  // Learning clamps
   learning: {
-    hpAlpha: 0.08,
-    standbyAlpha: 0.05,
-    showerAlpha: 0.04,
-
-    // gentle learning from reliable top-temp-after-shower correction
-    topShowerAlpha: 0.05,
-
     hpMinKW: 1.0,
     hpMaxKW: 3.5,
-
     standbyMinMul: 0.5,
     standbyMaxMul: 2.0,
-
     showerMinMul: 0.85,
     showerMaxMul: 1.20
   },
 
+  // --- Tap draw detection ---
+  tap: {
+    enabled: true,
+    idleBaselineTauSec: 1800,
+    riseThresholdC: 1.5,
+    slopeStartCPerMin: 0.25,
+    endBelowDeltaC: 0.7,
+    slopeStopCPerMin: -0.10,
+    minActiveMs: 20000,
+    maxEventMs: 15 * 60000,
+    assumedLpm: 2.0,
+    assumedOutTempC: 45
+  },
+
+  // --- Reheat recommendation ---
+  planner: {
+    enabled: true,
+    reserveMins42: 10,
+    targetMins42: 22,
+    urgentMins42: 7,
+    minLeadMins: 15,
+    maxHpMins: 240,
+    maxImmMins: 180,
+    horizonMins: 24 * 60
+  },
+
+  // --- External data sources ---
+  solar: {
+    enabled: true,
+    lat: 52.22094,
+    lon: 0.44630,
+    forecastHours: 48,
+    minWindowHours: 2,
+    scoreThreshold: 0.55,
+    maxPrecipProbPct: 60
+  },
+
+  agile: {
+    enabled: true,
+    endpoint: "https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-A/standard-unit-rates/",
+    lookaheadHours: 36
+  },
+
+  // --- Persistence ---
+  persist: {
+    keyV3: "dhw_model_v3",
+    keyV2Fallback: "dhw_model_v2",
+    keyV1Fallback: "dhw_model_v1",
+    minFlushGapMs: 60000,
+    maxOfflineHours: 168
+  },
+
+  // --- Error / staleness ---
+  stale: {
+    fastMs: 2 * 60000,
+    tempMs: 10 * 60000,
+    externalMs: 6 * 60 * 60000,
+    bootGraceMs: 45000
+  },
+
+  // Remote Shelly mappings
   remote: {
     hpPowerW: {
       url: "http://192.168.1.69/rpc/Switch.GetStatus?id=0",
-      path: "apower"
+      path: "apower",
+      kind: "number"
     },
     dhwMode: {
       url: "http://192.168.1.127/rpc/Switch.GetStatus?id=0",
       path: "output",
-      invert: true   // ON = CH, OFF = DHW
+      invert: true,
+      kind: "bool"
     },
     tankDemand: {
       url: "http://192.168.1.127/rpc/Input.GetStatus?id=0",
       path: "state",
-      invert: false
+      invert: false,
+      kind: "bool"
     },
     immersionOn: {
       url: "http://192.168.1.131/rpc/Switch.GetStatus?id=0",
       path: "output",
-      invert: false
+      invert: false,
+      kind: "bool"
     },
     immersionPowerW: {
       url: "http://192.168.1.131/rpc/Switch.GetStatus?id=0",
-      path: "apower"
+      path: "apower",
+      kind: "number"
     },
     showerPowerW: {
       url: "http://192.168.1.76/rpc/Switch.GetStatus?id=0",
-      path: "apower"   // verify if needed
+      path: "apower",
+      kind: "number"
     },
     feedC: {
       url: "http://192.168.1.127/rpc/Temperature.GetStatus?id=100",
-      path: "tC"
+      path: "tC",
+      kind: "number"
     },
     topC: {
       url: "http://192.168.1.127/rpc/Temperature.GetStatus?id=102",
-      path: "tC"
+      path: "tC",
+      kind: "number"
     }
   }
 };
 
 // --------------------
-// VIRTUAL COMPONENTS
+// 10 VIRTUAL COMPONENTS TOTAL
 // --------------------
 let V = {
-  kwh:       Virtual.getHandle("number:200"),
-  pct:       Virtual.getHandle("number:201"),
-  litres:    Virtual.getHandle("number:202"),
-  mins:      Virtual.getHandle("number:203"),
-  conf:      Virtual.getHandle("number:204"),
-  sinceFull: Virtual.getHandle("number:205"),
-  hpLearn:   Virtual.getHandle("number:206"),
-  calErr:    Virtual.getHandle("number:207"),
-  state:     Virtual.getHandle("text:200"),
-  source:    Virtual.getHandle("text:201")
-};
+  kwh:        Virtual.getHandle("number:200"),
+  pct:        Virtual.getHandle("number:201"),
+  mins42:     Virtual.getHandle("number:202"),
+  conf:       Virtual.getHandle("number:203"),
+  sinceFull:  Virtual.getHandle("number:204"),
+  nextReheat: Virtual.getHandle("number:205"),
 
-// --------------------
-// PERSISTENCE
-// --------------------
-let PERSIST = {
-  key: "dhw_model_v1",
-  dirty: false,
-  inFlight: false,
-  loaded: false,
-  lastSaveJson: null,
-  minFlushGapMs: 60000,
-  lastFlushUptimeMs: 0
-};
-
-// --------------------
-// POLL STATE
-// --------------------
-let POLL = {
-  busy: false,
-  fastList: ["hpPowerW", "dhwMode", "tankDemand", "immersionOn", "immersionPowerW", "showerPowerW"],
-  tempList: ["feedC", "topC"],
-  fastIndex: 0,
-  tempIndex: 0,
-  tick: 0
+  state:      Virtual.getHandle("text:200"),
+  liveMode:   Virtual.getHandle("text:201"),
+  health:     Virtual.getHandle("text:202"),
+  plan:       Virtual.getHandle("text:203")
 };
 
 // --------------------
 // STATE
 // --------------------
 let S = {
-  // two-layer energy model
   upperKwh: 0,
   lowerKwh: 0,
   energyKwh: 0,
-  lastTickMs: 0,
+
+  lastModelTickUptimeMs: 0,
+  lastSatisfiedEpochMs: 0,
+  lastUpdateEpochMs: 0,
 
   hpOn: false,
   hpPowerW: 0,
@@ -206,71 +223,43 @@ let S = {
 
   feedC: null,
   topC: null,
-  lastReliableTopUptimeMs: 0,
-  lastReliableTopC: null,
 
   hpChargingNow: false,
 
-  prevTankDemand: true,
-  prevChargeActive: false,
+  prevTankDemand: null,
+  prevChargeActive: null,
+  chargeSatisfiedThisRun: false,
 
-  // full/satisfied tracking
-  lastFullChargeC: CFG.statTempC,
-  lastSource: "BOOT",
-  lastSatisfiedUptimeMs: 0,
-  lastSatisfiedEpochMs: 0,
-
-  // calibration / learning
   calibrationCount: 0,
-  lastCalErrorKwh: 0,      // signed: positive = model too high before snap
   meanAbsCalErrorKwh: 0,
 
   learnHpKW: CFG.hpChargeKW,
   learnStandbyMul: 1.0,
   learnShowerMul: 1.0,
 
-  // interval since last full calibration
-  cycle: {
-    startUptimeMs: 0,
-    startEnergyKwh: 0,
-    hpPredKwh: 0,
-    immPredKwh: 0,
-    showerPredKwh: 0,
-    standbyPredKwh: 0,
-    hasHp: false,
-    hasImm: false,
-    hasShower: false
-  },
-
-  // charge tracking
-  chargeSatisfiedThisRun: false,
   partialChargeCountSinceFull: 0,
+  showerSessionsSinceFull: 0,
+  tapEventsSinceFull: 0,
 
-  // shower sessions
   session: {
     active: false,
     startUptimeMs: 0,
     startEpochMs: 0,
     runtimeMs: 0,
     lastFlowUptimeMs: 0,
-    reliableTopC: null,
-    reliableTopCaptured: false
-  },
-  showerSessionsSinceFull: 0,
-
-  // learning history
-  history: [],
-  forecast: {
-    morningProb: 0,
-    morningUncondKwh: 0,
-    morningCondKwh: 0,
-    eveningProb: 0,
-    eveningUncondKwh: 0,
-    eveningCondKwh: 0,
-    days: 0
+    reliableTopC: null
   },
 
-  // metric freshness
+  tap: {
+    baselineC: null,
+    lastTopC: null,
+    lastTopUptimeMs: 0,
+    active: false,
+    activeSinceUptimeMs: 0,
+    runtimeMs: 0,
+    countedEvent: false
+  },
+
   seen: {
     hpPowerW: 0,
     dhwMode: 0,
@@ -279,15 +268,67 @@ let S = {
     immersionPowerW: 0,
     showerPowerW: 0,
     feedC: 0,
-    topC: 0
+    topC: 0,
+    solar: 0,
+    agile: 0
+  },
+
+  err: {
+    present: {}
+  },
+
+  solar: {
+    ok: false,
+    fetchedEpochMs: 0,
+    bestStartEpochMs: 0,
+    bestEndEpochMs: 0,
+    bestScore: 0
+  },
+
+  agile: {
+    ok: false,
+    fetchedEpochMs: 0,
+    slots: []
+  },
+
+  plan: {
+    nextReheatMins: 0,
+    mode: "NONE",
+    hpMins: 0,
+    immMins: 0,
+    note: "NONE"
   }
 };
 
-// --------------------
+let POLL = {
+  busy: false,
+  fastList: ["hpPowerW", "dhwMode", "tankDemand", "immersionOn", "immersionPowerW", "showerPowerW"],
+  tempList: ["feedC", "topC"],
+  fastIndex: 0,
+  tempIndex: 0,
+  tick: 0
+};
+
+let EXT = {
+  nextSolarUptimeMs: 0,
+  nextAgileUptimeMs: 0,
+  solarEveryMs: 30 * 60000,
+  agileEveryMs: 30 * 60000
+};
+
+let PERSIST = {
+  dirty: false,
+  inFlight: false,
+  loaded: false,
+  lastSaveJson: null,
+  lastFlushUptimeMs: 0
+};
+
+// =====================================================
 // HELPERS
-// --------------------
+// =====================================================
 function isNum(x) {
-  return typeof x === "number" && !isNaN(x);
+  return typeof x === "number" && !isNaN(x) && isFinite(x);
 }
 
 function clamp(x, lo, hi) {
@@ -296,16 +337,12 @@ function clamp(x, lo, hi) {
   return x;
 }
 
-function round1(x) {
-  return Math.round(x * 10) / 10;
-}
+function round1(x) { return Math.round(x * 10) / 10; }
+function round2(x) { return Math.round(x * 100) / 100; }
+function nowEpochMs() { return (new Date()).getTime(); }
 
-function round2(x) {
-  return Math.round(x * 100) / 100;
-}
-
-function nowEpochMs() {
-  return (new Date()).getTime();
+function isEpochSane(ms) {
+  return isNum(ms) && ms > 1577836800000 && ms < 4102444800000;
 }
 
 function getColdC() {
@@ -324,10 +361,6 @@ function energyFromTemp(tempC) {
   return Math.max(0, kwhPerC() * (tempC - getColdC()));
 }
 
-function maxEnergyKwh() {
-  return energyFromTemp(CFG.maxTankTempC);
-}
-
 function avgTempFromEnergy(kwh) {
   return getColdC() + (kwh / kwhPerC());
 }
@@ -338,6 +371,10 @@ function showerKwhPerMinuteBase() {
 
 function showerKwhPerMinuteLearned() {
   return showerKwhPerMinuteBase() * S.learnShowerMul;
+}
+
+function tapKwhPerMinute() {
+  return (CFG.tap.assumedLpm * 4.186 * (CFG.tap.assumedOutTempC - getColdC())) / 3600.0;
 }
 
 function standingLossPerDayBase(avgTempC) {
@@ -366,135 +403,65 @@ function getByPath(obj, path) {
   return cur;
 }
 
-function boolValue(v, invert) {
-  let b = !!v;
+// PART 2 OF 4
+function parseBoolValue(v, invert) {
+  let b = null;
+  if (typeof v === "boolean") b = v;
+  else if (v === 1 || v === "1") b = true;
+  else if (v === 0 || v === "0") b = false;
+  if (b === null) return null;
   return invert ? !b : b;
+}
+
+function parseNumValue(v) {
+  return isNum(v) ? v : null;
 }
 
 function markSeen(name) {
   S.seen[name] = Shelly.getUptimeMs();
 }
 
-function minutesSinceUptime(uptimeMs) {
-  if (!uptimeMs) return null;
-  return Math.floor((Shelly.getUptimeMs() - uptimeMs) / 60000);
+function minutesSinceEpoch(epochMs) {
+  if (!isEpochSane(epochMs)) return null;
+  let dt = nowEpochMs() - epochMs;
+  if (dt < 0) return null;
+  return Math.floor(dt / 60000);
 }
 
-// --------------------
-// PERSISTENCE HELPERS
-// --------------------
-function persistSnapshot() {
-  return {
-    learnHpKW: S.learnHpKW,
-    learnStandbyMul: S.learnStandbyMul,
-    learnShowerMul: S.learnShowerMul,
-    calibrationCount: S.calibrationCount,
-    meanAbsCalErrorKwh: S.meanAbsCalErrorKwh
+function appendQuery(url, query) {
+  return url + (url.indexOf("?") >= 0 ? "&" : "?") + query;
+}
+
+// =====================================================
+// ERROR REGISTRY
+// =====================================================
+function errSet(key, msg, severity) {
+  S.err.present[key] = {
+    msg: msg,
+    severity: severity || 2,
+    sinceUptimeMs: Shelly.getUptimeMs()
   };
 }
 
-function markPersistDirty() {
-  PERSIST.dirty = true;
+function errClear(key) {
+  if (S.err.present[key]) delete S.err.present[key];
 }
 
-function applyPersistedSnapshot(obj) {
-  if (!obj || typeof obj !== "object") return;
-
-  if (isNum(obj.learnHpKW)) {
-    S.learnHpKW = clamp(obj.learnHpKW, CFG.learning.hpMinKW, CFG.learning.hpMaxKW);
+function errSummary() {
+  let chosen = null;
+  for (let k in S.err.present) {
+    if (!S.err.present[k]) continue;
+    if (!chosen || S.err.present[k].severity > chosen.severity ||
+        (S.err.present[k].severity === chosen.severity && S.err.present[k].sinceUptimeMs < chosen.sinceUptimeMs)) {
+      chosen = S.err.present[k];
+    }
   }
-  if (isNum(obj.learnStandbyMul)) {
-    S.learnStandbyMul = clamp(obj.learnStandbyMul, CFG.learning.standbyMinMul, CFG.learning.standbyMaxMul);
-  }
-  if (isNum(obj.learnShowerMul)) {
-    S.learnShowerMul = clamp(obj.learnShowerMul, CFG.learning.showerMinMul, CFG.learning.showerMaxMul);
-  }
-  if (isNum(obj.calibrationCount)) {
-    S.calibrationCount = Math.max(0, Math.floor(obj.calibrationCount));
-  }
-  if (isNum(obj.meanAbsCalErrorKwh)) {
-    S.meanAbsCalErrorKwh = Math.max(0, obj.meanAbsCalErrorKwh);
-  }
+  return chosen ? chosen.msg : "OKAY";
 }
 
-function loadPersistedModel() {
-  if (PERSIST.inFlight || PERSIST.loaded) return;
-  PERSIST.inFlight = true;
-
-  Shelly.call("KVS.Get", { key: PERSIST.key }, function(result, error_code, error_message) {
-    PERSIST.inFlight = false;
-    PERSIST.loaded = true;
-
-    if (error_code === -105) {
-      PERSIST.dirty = true;
-      print("KVS empty, starting with defaults");
-      return;
-    }
-
-    if (error_code !== 0) {
-      print("KVS.Get failed:", error_code, error_message);
-      return;
-    }
-
-    let raw = null;
-    if (result && typeof result.value !== "undefined") {
-      raw = result.value;
-    } else if (typeof result === "string") {
-      raw = result;
-    }
-
-    if (!raw) {
-      PERSIST.dirty = true;
-      return;
-    }
-
-    try {
-      let obj = JSON.parse(raw);
-      applyPersistedSnapshot(obj);
-      PERSIST.lastSaveJson = raw;
-      print("KVS model loaded");
-      refreshVirtuals();
-    } catch (e) {
-      print("KVS model parse error, resetting to defaults");
-      PERSIST.dirty = true;
-    }
-  });
-}
-
-function flushPersistedModel(force) {
-  let nowU = Shelly.getUptimeMs();
-
-  if (!PERSIST.loaded && !force) return;
-  if (!PERSIST.dirty && !force) return;
-  if (PERSIST.inFlight) return;
-  if (POLL.busy) return;
-  if (!force && (nowU - PERSIST.lastFlushUptimeMs) < PERSIST.minFlushGapMs) return;
-
-  let json = JSON.stringify(persistSnapshot());
-  if (!force && json === PERSIST.lastSaveJson) {
-    PERSIST.dirty = false;
-    return;
-  }
-
-  PERSIST.inFlight = true;
-  Shelly.call("KVS.Set", { key: PERSIST.key, value: json }, function(result, error_code, error_message) {
-    PERSIST.inFlight = false;
-
-    if (error_code !== 0) {
-      print("KVS.Set failed:", error_code, error_message);
-      return;
-    }
-
-    PERSIST.lastSaveJson = json;
-    PERSIST.lastFlushUptimeMs = Shelly.getUptimeMs();
-    PERSIST.dirty = false;
-    print("KVS model saved");
-  });
-}
-
-// --------------------
+// =====================================================
 // TWO-LAYER MODEL
-// --------------------
+// =====================================================
 function upperCapAtTemp(tempC) {
   return CFG.upperFraction * energyFromTemp(tempC);
 }
@@ -540,27 +507,23 @@ function addToLower(kwh) {
 
 function addHpEnergy(kwh) {
   if (kwh <= 0) return;
-
   let lowerFirst = kwh * CFG.hpToLowerFrac;
   let upperPart = kwh - lowerFirst;
 
   let rem = addToLower(lowerFirst);
   rem = addToUpper(upperPart + rem);
   if (rem > 0) addToLower(rem);
-
   clampLayers();
 }
 
 function addImmersionEnergy(kwh) {
   if (kwh <= 0) return;
-
   let rem = addToUpper(kwh * CFG.immersionToUpperFrac);
   if (rem > 0) addToLower(rem);
-
   clampLayers();
 }
 
-function removeShowerEnergy(kwh) {
+function removeEnergy(kwh) {
   if (kwh <= 0) return;
 
   let fromUpper = Math.min(S.upperKwh, kwh);
@@ -570,7 +533,6 @@ function removeShowerEnergy(kwh) {
   if (kwh > 0) {
     let fromLower = Math.min(S.lowerKwh, kwh);
     S.lowerKwh -= fromLower;
-    kwh -= fromLower;
   }
 
   clampLayers();
@@ -586,295 +548,60 @@ function applyStandingLoss(totalLossKwh) {
 
   S.upperKwh = Math.max(0, S.upperKwh - totalLossKwh * upperShare);
   S.lowerKwh = Math.max(0, S.lowerKwh - totalLossKwh * lowerShare);
-
   clampLayers();
 }
 
-// --------------------
-// LEARNING SUPPORT
-// --------------------
-function resetCycleLearning() {
-  S.cycle.startUptimeMs = Shelly.getUptimeMs();
-  S.cycle.startEnergyKwh = S.energyKwh;
-  S.cycle.hpPredKwh = 0;
-  S.cycle.immPredKwh = 0;
-  S.cycle.showerPredKwh = 0;
-  S.cycle.standbyPredKwh = 0;
-  S.cycle.hasHp = false;
-  S.cycle.hasImm = false;
-  S.cycle.hasShower = false;
+// =====================================================
+// METRIC STALENESS + DERIVED STATES
+// =====================================================
+function isMetricStale(name, maxAgeMs) {
+  let last = S.seen[name] || 0;
+  if (!last) return true;
+  return (Shelly.getUptimeMs() - last) > maxAgeMs;
 }
 
-function learnFromCalibration(signedErr) {
-  if (S.cycle.hpPredKwh > 0.5) {
-    let ratio = signedErr / S.cycle.hpPredKwh;
-    let factor = 1.0 - (CFG.learning.hpAlpha * ratio);
-    factor = clamp(factor, 0.90, 1.10);
-
-    S.learnHpKW = clamp(
-      S.learnHpKW * factor,
-      CFG.learning.hpMinKW,
-      CFG.learning.hpMaxKW
-    );
-    markPersistDirty();
-  }
-
-  if (S.cycle.standbyPredKwh > 0.2) {
-    let ratio = signedErr / S.cycle.standbyPredKwh;
-    let factor = 1.0 + (CFG.learning.standbyAlpha * ratio);
-    factor = clamp(factor, 0.90, 1.10);
-
-    S.learnStandbyMul = clamp(
-      S.learnStandbyMul * factor,
-      CFG.learning.standbyMinMul,
-      CFG.learning.standbyMaxMul
-    );
-    markPersistDirty();
-  }
-
-  if (S.cycle.showerPredKwh > 0.5) {
-    let ratio = signedErr / S.cycle.showerPredKwh;
-    let factor = 1.0 + (CFG.learning.showerAlpha * ratio);
-    factor = clamp(factor, 0.92, 1.08);
-
-    S.learnShowerMul = clamp(
-      S.learnShowerMul * factor,
-      CFG.learning.showerMinMul,
-      CFG.learning.showerMaxMul
-    );
-    markPersistDirty();
-  }
-}
-
-// --------------------
-// EVENT-BASED TOP CORRECTIONS
-// --------------------
-function correctUpperFromReliableTop(measuredTopC, sessionKwh) {
-  if (!isNum(measuredTopC)) return;
-
-  let topC = clamp(measuredTopC, getColdC(), CFG.maxTankTempC);
-  let targetUpper = upperCapAtTemp(topC);
-  let predUpper = S.upperKwh;
-  let errUpper = predUpper - targetUpper; // positive = model upper too high
-
-  if (isNum(sessionKwh) && sessionKwh > 0.3) {
-    let ratio = errUpper / sessionKwh;
-    let factor = 1.0 + (CFG.learning.topShowerAlpha * ratio);
-    factor = clamp(factor, 0.97, 1.03);
-
-    S.learnShowerMul = clamp(
-      S.learnShowerMul * factor,
-      CFG.learning.showerMinMul,
-      CFG.learning.showerMaxMul
-    );
-    markPersistDirty();
-  }
-
-  if (predUpper > targetUpper) {
-    S.upperKwh = targetUpper;
-  } else {
-    S.upperKwh = predUpper + 0.5 * (targetUpper - predUpper);
-  }
-
-  clampLayers();
-
-  S.lastReliableTopUptimeMs = Shelly.getUptimeMs();
-  S.lastReliableTopC = topC;
-}
-
-function correctUpperFromImmersionThermostat65() {
-  let targetUpper = upperCapAtTemp(65);
-
-  if (S.upperKwh < targetUpper) {
-    S.upperKwh = targetUpper;
-    clampLayers();
-  }
-
-  S.lastReliableTopUptimeMs = Shelly.getUptimeMs();
-  S.lastReliableTopC = 65;
-}
-
-// --------------------
-// CHARGE / DISCHARGE MODEL
-// --------------------
 function computeHpChargingNow() {
+  if (isMetricStale("hpPowerW", CFG.stale.fastMs) ||
+      isMetricStale("dhwMode", CFG.stale.fastMs) ||
+      isMetricStale("tankDemand", CFG.stale.fastMs)) {
+    return false;
+  }
+
   if (!(S.hpOn && S.dhwMode && S.tankDemand)) return false;
-  if (isNum(S.feedC) && S.feedC >= CFG.minUsefulFeedC) return true;
-  if (!isNum(S.feedC)) return true;
-  return false;
+
+  if (!isMetricStale("feedC", CFG.stale.tempMs) && isNum(S.feedC)) {
+    return S.feedC >= CFG.minUsefulFeedC;
+  }
+  return true;
 }
 
 function computeImmersionHeatingNow() {
+  if (isMetricStale("immersionOn", CFG.stale.fastMs)) return false;
   if (!S.immersionOn) return false;
-  if (isNum(S.immersionPowerW)) {
+
+  if (!isMetricStale("immersionPowerW", CFG.stale.fastMs) && isNum(S.immersionPowerW)) {
     return S.immersionPowerW >= CFG.immersionLowPowerW;
   }
-  return true;
+  return false;
+}
+
+function computeShowerRunning() {
+  if (isMetricStale("showerPowerW", CFG.stale.fastMs) || !isNum(S.showerPowerW)) {
+    return false;
+  }
+
+  if (!S.showerRunning && S.showerPowerW >= CFG.showerOnW) return true;
+  if (S.showerRunning && S.showerPowerW <= CFG.showerOffW) return false;
+  return S.showerRunning;
 }
 
 function currentChargeActive() {
   return S.immersionHeatingNow || S.hpChargingNow;
 }
 
-function integrate() {
-  let nowMs = Shelly.getUptimeMs();
-
-  if (S.lastTickMs === 0) {
-    S.lastTickMs = nowMs;
-    return;
-  }
-
-  let dtMs = nowMs - S.lastTickMs;
-  let dtHours = dtMs / 3600000.0;
-  if (dtHours <= 0) return;
-
-  S.hpChargingNow = computeHpChargingNow();
-  S.immersionHeatingNow = computeImmersionHeatingNow();
-
-  if (S.hpChargingNow) {
-    let hpKwh = S.learnHpKW * dtHours;
-    addHpEnergy(hpKwh);
-    S.cycle.hpPredKwh += hpKwh;
-    S.cycle.hasHp = true;
-  }
-
-  if (S.immersionHeatingNow) {
-    let immKW = isNum(S.immersionPowerW) ? (S.immersionPowerW / 1000.0) : CFG.immersionKW;
-    let immKwh = immKW * dtHours;
-    addImmersionEnergy(immKwh);
-    S.cycle.immPredKwh += immKwh;
-    S.cycle.hasImm = true;
-  }
-
-  if (S.showerRunning) {
-    let used = showerKwhPerMinuteLearned() * (dtHours * 60.0);
-    removeShowerEnergy(used);
-    S.cycle.showerPredKwh += used;
-    S.cycle.hasShower = true;
-
-    if (S.session.active) {
-      S.session.runtimeMs += dtMs;
-      S.session.lastFlowUptimeMs = nowMs;
-    }
-  }
-
-  let avgTempC = avgTempFromEnergy(S.energyKwh);
-  let standby = (standingLossPerDayBase(avgTempC) * S.learnStandbyMul / 24.0) * dtHours;
-  applyStandingLoss(standby);
-  S.cycle.standbyPredKwh += standby;
-
-  S.lastTickMs = nowMs;
-}
-
-function snapTankToFull() {
-  let fullKwh = energyFromTemp(CFG.statTempC);
-  let modelBefore = S.energyKwh;
-  let signedErr = modelBefore - fullKwh; // positive = model too high
-
-  S.lastCalErrorKwh = signedErr;
-  S.calibrationCount += 1;
-  let absErr = Math.abs(signedErr);
-
-  if (S.calibrationCount === 1) {
-    S.meanAbsCalErrorKwh = absErr;
-  } else {
-    S.meanAbsCalErrorKwh =
-      ((S.meanAbsCalErrorKwh * (S.calibrationCount - 1)) + absErr) / S.calibrationCount;
-  }
-  markPersistDirty();
-
-  learnFromCalibration(signedErr);
-
-  setFullAtStatTemp();
-  S.lastFullChargeC = CFG.statTempC;
-  S.lastSource = S.immersionOn ? "IMMERSION FULL" : "HP FULL";
-  S.lastSatisfiedUptimeMs = Shelly.getUptimeMs();
-  S.lastSatisfiedEpochMs = nowEpochMs();
-  S.chargeSatisfiedThisRun = true;
-  S.partialChargeCountSinceFull = 0;
-  S.showerSessionsSinceFull = 0;
-
-  resetCycleLearning();
-}
-
-// --------------------
-// SHOWER SESSION GROUPING / LEARNING
-// --------------------
-function currentDayKey(epochMs) {
-  let d = epochMs ? new Date(epochMs) : new Date();
-  let y = d.getFullYear();
-  let m = ("0" + (d.getMonth() + 1)).slice(-2);
-  let day = ("0" + d.getDate()).slice(-2);
-  return y + "-" + m + "-" + day;
-}
-
-function classifyWindow(epochMs) {
-  let d = new Date(epochMs);
-  let h = d.getHours() + d.getMinutes() / 60.0;
-
-  if (h >= CFG.morningStartHour && h < CFG.morningEndHour) return "morning";
-  if (h >= CFG.eveningStartHour && h < CFG.eveningEndHour) return "evening";
-  return "other";
-}
-
-function getOrCreateDayRecord(dayKey) {
-  for (let i = 0; i < S.history.length; i++) {
-    if (S.history[i].dayKey === dayKey) return S.history[i];
-  }
-
-  let rec = {
-    dayKey: dayKey,
-    morningKwh: 0,
-    eveningKwh: 0,
-    otherKwh: 0,
-    morningSessions: 0,
-    eveningSessions: 0,
-    otherSessions: 0
-  };
-
-  S.history.push(rec);
-
-  while (S.history.length > CFG.historyDays) {
-    S.history.shift();
-  }
-
-  return rec;
-}
-
-function updateForecast() {
-  let days = S.history.length;
-  let morningOcc = 0, eveningOcc = 0;
-  let morningSum = 0, eveningSum = 0;
-
-  for (let i = 0; i < S.history.length; i++) {
-    let d = S.history[i];
-    if (d.morningKwh > 0) morningOcc++;
-    if (d.eveningKwh > 0) eveningOcc++;
-    morningSum += d.morningKwh;
-    eveningSum += d.eveningKwh;
-  }
-
-  S.forecast.days = days;
-
-  if (days > 0) {
-    S.forecast.morningProb = morningOcc / days;
-    S.forecast.eveningProb = eveningOcc / days;
-
-    S.forecast.morningUncondKwh = morningSum / days;
-    S.forecast.eveningUncondKwh = eveningSum / days;
-
-    S.forecast.morningCondKwh = morningOcc > 0 ? (morningSum / morningOcc) : 0;
-    S.forecast.eveningCondKwh = eveningOcc > 0 ? (eveningSum / eveningOcc) : 0;
-  } else {
-    S.forecast.morningProb = 0;
-    S.forecast.eveningProb = 0;
-    S.forecast.morningUncondKwh = 0;
-    S.forecast.eveningUncondKwh = 0;
-    S.forecast.morningCondKwh = 0;
-    S.forecast.eveningCondKwh = 0;
-  }
-}
-
+// =====================================================
+// SHOWER SESSION GROUPING
+// =====================================================
 function startShowerSession() {
   if (S.session.active) return;
 
@@ -885,40 +612,21 @@ function startShowerSession() {
   S.session.runtimeMs = 0;
   S.session.lastFlowUptimeMs = nowU;
   S.session.reliableTopC = null;
-  S.session.reliableTopCaptured = false;
 }
 
 function finalizeShowerSession() {
   if (!S.session.active) return;
 
-  let runtimeMin = S.session.runtimeMs / 60000.0;
-  let kwh = runtimeMin * showerKwhPerMinuteLearned();
-  let bucket = classifyWindow(S.session.startEpochMs);
-  let rec = getOrCreateDayRecord(currentDayKey(S.session.startEpochMs));
-
-  if (bucket === "morning") {
-    rec.morningKwh += kwh;
-    rec.morningSessions += 1;
-  } else if (bucket === "evening") {
-    rec.eveningKwh += kwh;
-    rec.eveningSessions += 1;
-  } else {
-    rec.otherKwh += kwh;
-    rec.otherSessions += 1;
-  }
-
   if (S.session.runtimeMs >= CFG.reliableTopAfterRunMs && isNum(S.session.reliableTopC)) {
-    correctUpperFromReliableTop(S.session.reliableTopC, kwh);
+    let topC = clamp(S.session.reliableTopC, getColdC(), CFG.maxTankTempC);
+    let targetUpper = upperCapAtTemp(topC);
+    if (S.upperKwh > targetUpper) {
+      S.upperKwh = targetUpper;
+      clampLayers();
+    }
   }
 
   S.showerSessionsSinceFull += 1;
-  updateForecast();
-
-  print("Shower session closed:",
-        "runtimeMin=", round1(runtimeMin),
-        "kWh=", round2(kwh),
-        "window=", bucket,
-        "reliableTop=", isNum(S.session.reliableTopC) ? round1(S.session.reliableTopC) : "n/a");
 
   S.session.active = false;
   S.session.startUptimeMs = 0;
@@ -926,43 +634,174 @@ function finalizeShowerSession() {
   S.session.runtimeMs = 0;
   S.session.lastFlowUptimeMs = 0;
   S.session.reliableTopC = null;
-  S.session.reliableTopCaptured = false;
 }
 
-// --------------------
-// CONFIDENCE
-// --------------------
-function computeConfidence() {
-  let c = 100;
-  let minsFromFull = minutesSinceUptime(S.lastSatisfiedUptimeMs);
+// =====================================================
+// TAP DRAW DETECTION
+// =====================================================
+function isHydraulicallyIdle() {
+  return !S.showerRunning && !S.hpChargingNow && !S.immersionHeatingNow;
+}
 
-  if (minsFromFull === null) {
-    c = 55;
-  } else {
-    c -= Math.min(35, minsFromFull / 20);
+function resetTapEvent() {
+  S.tap.active = false;
+  S.tap.activeSinceUptimeMs = 0;
+  S.tap.runtimeMs = 0;
+  S.tap.countedEvent = false;
+}
+
+function updateTapBaseline(dtSec) {
+  if (!isNum(S.topC)) return;
+  if (!isHydraulicallyIdle()) return;
+  if (S.tap.active) return;
+
+  if (!isNum(S.tap.baselineC)) {
+    S.tap.baselineC = S.topC;
+    return;
   }
 
-  c -= Math.min(24, S.showerSessionsSinceFull * 8);
-  c -= Math.min(20, S.partialChargeCountSinceFull * 5);
+  let tau = Math.max(30, CFG.tap.idleBaselineTauSec);
+  let alpha = 1.0 - Math.exp(-dtSec / tau);
+  S.tap.baselineC = (1 - alpha) * S.tap.baselineC + alpha * S.topC;
+}
+
+function updateTapDetection(dtMs) {
+  if (!CFG.tap.enabled) return;
+
+  if (isMetricStale("topC", CFG.stale.tempMs) || !isNum(S.topC)) {
+    resetTapEvent();
+    S.tap.lastTopC = null;
+    S.tap.lastTopUptimeMs = 0;
+    return;
+  }
 
   let nowU = Shelly.getUptimeMs();
-  if (S.seen.feedC && (nowU - S.seen.feedC) > 900000) c -= 8;
-  if (S.seen.topC && (nowU - S.seen.topC) > 900000) c -= 4;
-  if (!S.seen.feedC) c -= 8;
-  if (!S.seen.topC) c -= 4;
+  let dtSec = Math.max(0.001, dtMs / 1000.0);
 
-  if (S.lastReliableTopUptimeMs && (nowU - S.lastReliableTopUptimeMs) < 1800000) {
-    c += 5;
+  updateTapBaseline(dtSec);
+
+  let slopeCPerMin = 0;
+  if (isNum(S.tap.lastTopC) && S.tap.lastTopUptimeMs) {
+    let dC = S.topC - S.tap.lastTopC;
+    let dMin = Math.max(0.001, (nowU - S.tap.lastTopUptimeMs) / 60000.0);
+    slopeCPerMin = dC / dMin;
+  }
+  S.tap.lastTopC = S.topC;
+  S.tap.lastTopUptimeMs = nowU;
+
+  if (!isHydraulicallyIdle()) {
+    resetTapEvent();
+    return;
   }
 
-  c -= Math.min(15, S.meanAbsCalErrorKwh * 5);
+  if (!isNum(S.tap.baselineC)) return;
 
-  return clamp(Math.round(c), 10, 100);
+  let delta = S.topC - S.tap.baselineC;
+
+  if (!S.tap.active) {
+    if (delta >= CFG.tap.riseThresholdC && slopeCPerMin >= CFG.tap.slopeStartCPerMin) {
+      S.tap.active = true;
+      S.tap.activeSinceUptimeMs = nowU;
+      S.tap.runtimeMs = 0;
+      S.tap.countedEvent = false;
+    }
+    return;
+  }
+
+  S.tap.runtimeMs += dtMs;
+
+  if ((nowU - S.tap.activeSinceUptimeMs) >= CFG.tap.minActiveMs) {
+    removeEnergy(tapKwhPerMinute() * (dtMs / 60000.0));
+    if (!S.tap.countedEvent) {
+      S.tapEventsSinceFull += 1;
+      S.tap.countedEvent = true;
+    }
+  }
+
+  if (S.tap.runtimeMs >= CFG.reliableTopAfterRunMs) {
+    let topC = clamp(S.topC, getColdC(), CFG.maxTankTempC);
+    let targetUpper = upperCapAtTemp(topC);
+    if (S.upperKwh > targetUpper) {
+      S.upperKwh = targetUpper;
+      clampLayers();
+    }
+  }
+
+  let activeLongEnough = (nowU - S.tap.activeSinceUptimeMs) >= CFG.tap.minActiveMs;
+  let tooLong = S.tap.runtimeMs >= CFG.tap.maxEventMs;
+
+  if ((activeLongEnough && delta <= CFG.tap.endBelowDeltaC && slopeCPerMin <= 0.05) ||
+      (activeLongEnough && slopeCPerMin <= CFG.tap.slopeStopCPerMin) ||
+      tooLong) {
+    resetTapEvent();
+  }
 }
 
-// --------------------
-// STATE / DISPLAY
-// --------------------
+// =====================================================
+// INTEGRATION
+// =====================================================
+function integrateModel(dtMs) {
+  let dtHours = dtMs / 3600000.0;
+  if (dtHours <= 0) return;
+
+  if (S.hpChargingNow) {
+    addHpEnergy(S.learnHpKW * dtHours);
+  }
+
+  if (S.immersionHeatingNow) {
+    let immKW = CFG.immersionKW;
+    if (!isMetricStale("immersionPowerW", CFG.stale.fastMs) && isNum(S.immersionPowerW)) {
+      immKW = S.immersionPowerW / 1000.0;
+    }
+    addImmersionEnergy(immKW * dtHours);
+  }
+
+  if (S.showerRunning) {
+    removeEnergy(showerKwhPerMinuteLearned() * (dtMs / 60000.0));
+    if (S.session.active) {
+      S.session.runtimeMs += dtMs;
+      S.session.lastFlowUptimeMs = Shelly.getUptimeMs();
+    }
+  }
+
+  let avgTempC = avgTempFromEnergy(S.energyKwh);
+  let standby = (standingLossPerDayBase(avgTempC) * S.learnStandbyMul / 24.0) * dtHours;
+  applyStandingLoss(standby);
+}
+
+// =====================================================
+// FULL CALIBRATION
+// =====================================================
+function snapTankToFull() {
+  let fullKwh = energyFromTemp(CFG.statTempC);
+  let signedErr = S.energyKwh - fullKwh;
+  let absErr = Math.abs(signedErr);
+
+  S.calibrationCount += 1;
+  if (S.calibrationCount === 1) {
+    S.meanAbsCalErrorKwh = absErr;
+  } else {
+    S.meanAbsCalErrorKwh = ((S.meanAbsCalErrorKwh * (S.calibrationCount - 1)) + absErr) / S.calibrationCount;
+  }
+
+  if (absErr > 0.2) {
+    let factor = 1.0 + clamp(signedErr / Math.max(0.5, fullKwh), -0.05, 0.05);
+    S.learnStandbyMul = clamp(S.learnStandbyMul * factor, CFG.learning.standbyMinMul, CFG.learning.standbyMaxMul);
+  }
+
+  setFullAtStatTemp();
+  S.lastSatisfiedEpochMs = nowEpochMs();
+  S.partialChargeCountSinceFull = 0;
+  S.showerSessionsSinceFull = 0;
+  S.tapEventsSinceFull = 0;
+  S.chargeSatisfiedThisRun = true;
+}
+
+// =====================================================
+// CONFIDENCE + DISPLAY HELPERS
+// =====================================================
+
+// PART 3 OF 4
 function litres42Remaining() {
   let denom = 4.186 * (CFG.showerOutTempC - getColdC());
   if (denom <= 0) return 0;
@@ -975,63 +814,668 @@ function minutes42Remaining() {
 
 function tankState() {
   let mins = minutes42Remaining();
-
   if (mins < 8) return "LOW";
   if (mins < 15) return "1 short shower";
   if (mins < 22) return "1 shower";
   return "OK";
 }
 
-function tankMode() {
+function liveModeText() {
   if (S.showerRunning) return "SHOWER";
+  if (S.tap.active) return "TAP";
+  if (S.immersionHeatingNow && S.hpChargingNow) return "HP+IMM";
   if (S.immersionHeatingNow) return "IMMERSION";
   if (S.hpChargingNow) return "HP+DHW";
   return "IDLE";
 }
 
+function computeConfidence() {
+  let c = 100;
+  let minsFromFull = minutesSinceEpoch(S.lastSatisfiedEpochMs);
+
+  if (minsFromFull === null) c = 55;
+  else c -= Math.min(35, minsFromFull / 20);
+
+  c -= Math.min(24, S.showerSessionsSinceFull * 8);
+  c -= Math.min(12, S.tapEventsSinceFull * 2);
+  c -= Math.min(20, S.partialChargeCountSinceFull * 5);
+
+  if (isMetricStale("feedC", CFG.stale.tempMs)) c -= 8;
+  if (isMetricStale("topC", CFG.stale.tempMs)) c -= 4;
+  if (isMetricStale("hpPowerW", CFG.stale.fastMs)) c -= 6;
+  if (isMetricStale("immersionPowerW", CFG.stale.fastMs)) c -= 4;
+  if (isMetricStale("showerPowerW", CFG.stale.fastMs)) c -= 4;
+
+  c -= Math.min(15, S.meanAbsCalErrorKwh * 5);
+  return clamp(Math.round(c), 10, 100);
+}
+
+function planText() {
+  if (!S.plan || S.plan.mode === "NONE") return "HOLD";
+  if (S.plan.nextReheatMins <= 0) return "NOW " + S.plan.note;
+  return "IN " + S.plan.nextReheatMins + "m " + S.plan.note;
+}
+
 function refreshVirtuals() {
   let fullKwh = energyFromTemp(CFG.statTempC);
   let pct = fullKwh > 0 ? (100.0 * S.energyKwh / fullKwh) : 0;
-  let conf = computeConfidence();
-  let sinceFull = minutesSinceUptime(S.lastSatisfiedUptimeMs);
+  let sinceFull = minutesSinceEpoch(S.lastSatisfiedEpochMs);
 
-  if (V.kwh) V.kwh.setValue(round2(S.energyKwh));
-  if (V.pct) V.pct.setValue(round1(clamp(pct, 0, 150)));
-  if (V.litres) V.litres.setValue(Math.round(litres42Remaining()));
-  if (V.mins) V.mins.setValue(round1(minutes42Remaining()));
-  if (V.conf) V.conf.setValue(conf);
-  if (V.sinceFull) V.sinceFull.setValue(sinceFull !== null ? sinceFull : -1);
-  if (V.hpLearn) V.hpLearn.setValue(round2(S.learnHpKW));
-  if (V.calErr) V.calErr.setValue(round2(S.meanAbsCalErrorKwh));
+  if (V.kwh)        V.kwh.setValue(round2(S.energyKwh));
+  if (V.pct)        V.pct.setValue(round1(clamp(pct, 0, 150)));
+  if (V.mins42)     V.mins42.setValue(round1(minutes42Remaining()));
+  if (V.conf)       V.conf.setValue(computeConfidence());
+  if (V.sinceFull)  V.sinceFull.setValue(sinceFull !== null ? sinceFull : -1);
+  if (V.nextReheat) V.nextReheat.setValue(S.plan.nextReheatMins);
 
-  if (V.state) V.state.setValue(tankState());
-  if (V.source) V.source.setValue(tankMode());
+  if (V.state)      V.state.setValue(tankState());
+  if (V.liveMode)   V.liveMode.setValue(liveModeText());
+  if (V.health)     V.health.setValue(errSummary());
+  if (V.plan)       V.plan.setValue(planText());
 }
 
-// --------------------
-// TRANSITIONS
-// --------------------
-function applyTransitions() {
-  let nowU = Shelly.getUptimeMs();
+// =====================================================
+// PLANNER
+// =====================================================
+function computeTimeToReserveMins(reserveKwh) {
+  if (S.energyKwh <= reserveKwh) return 0;
 
-  // HP hysteresis from measured power draw
-  if (!S.hpOn && isNum(S.hpPowerW) && S.hpPowerW >= CFG.hpOnW) {
-    S.hpOn = true;
-  } else if (S.hpOn && isNum(S.hpPowerW) && S.hpPowerW <= CFG.hpOffW) {
+  let avgTempC = avgTempFromEnergy(S.energyKwh);
+  let standbyKw = (standingLossPerDayBase(avgTempC) * S.learnStandbyMul) / 24.0;
+  if (standbyKw <= 0.0001) return CFG.planner.horizonMins;
+
+  let hours = (S.energyKwh - reserveKwh) / standbyKw;
+  if (!isNum(hours) || hours < 0) return 0;
+  return clamp(Math.floor(hours * 60), 0, CFG.planner.horizonMins);
+}
+
+function computeReheatPlan() {
+  if (!CFG.planner.enabled) return;
+
+  let mins = minutes42Remaining();
+  let kwhPerMin42 = showerKwhPerMinuteBase();
+  let reserveKwh = CFG.planner.reserveMins42 * kwhPerMin42;
+  let targetKwh = CFG.planner.targetMins42 * kwhPerMin42;
+  let immediateNeededKwh = Math.max(0, targetKwh - S.energyKwh);
+  let futureRefillKwh = Math.max(0, targetKwh - reserveKwh);
+  let planKwh = immediateNeededKwh > 0.05 ? immediateNeededKwh : futureRefillKwh;
+  let minsToReserve = computeTimeToReserveMins(reserveKwh);
+
+  let plan = {
+    nextReheatMins: minsToReserve,
+    mode: "NONE",
+    hpMins: 0,
+    immMins: 0,
+    note: "HOLD"
+  };
+
+  if (planKwh <= 0.05) {
+    S.plan = plan;
+    return;
+  }
+
+  let hpMins = clamp(Math.ceil((planKwh / Math.max(0.5, S.learnHpKW)) * 60), 0, CFG.planner.maxHpMins);
+  let immMins = clamp(Math.ceil((planKwh / CFG.immersionKW) * 60), 0, CFG.planner.maxImmMins);
+
+  if (mins <= CFG.planner.urgentMins42 || minsToReserve <= CFG.planner.minLeadMins) {
+    plan.nextReheatMins = 0;
+    if (mins <= 3) {
+      plan.mode = "HP+IMM";
+      plan.hpMins = hpMins;
+      plan.immMins = immMins;
+      plan.note = "HP+IMM UNTIL SAT";
+    } else {
+      plan.mode = "HP";
+      plan.hpMins = hpMins;
+      plan.note = "HP " + hpMins + "m";
+    }
+    S.plan = plan;
+    return;
+  }
+
+  let nowE = nowEpochMs();
+  let solarInMins = null;
+  let agileInMins = null;
+
+  if (CFG.solar.enabled && S.solar.ok && isEpochSane(S.solar.bestStartEpochMs)) {
+    let dt = S.solar.bestStartEpochMs - nowE;
+    if (dt >= 0) solarInMins = Math.floor(dt / 60000);
+  }
+
+  if (CFG.agile.enabled && S.agile.ok && S.agile.slots.length > 0) {
+    let best = null;
+    for (let i = 0; i < S.agile.slots.length; i++) {
+      let slot = S.agile.slots[i];
+      if (!slot || !isNum(slot.priceIncVat) || slot.fromEpochMs < nowE) continue;
+      if (!best || slot.priceIncVat < best.priceIncVat ||
+          (slot.priceIncVat === best.priceIncVat && slot.fromEpochMs < best.fromEpochMs)) {
+        best = slot;
+      }
+    }
+    if (best) agileInMins = Math.floor((best.fromEpochMs - nowE) / 60000);
+  }
+
+  let latestSafeStart = Math.max(0, minsToReserve - CFG.planner.minLeadMins);
+
+  if (solarInMins !== null && solarInMins <= latestSafeStart && solarInMins <= CFG.planner.horizonMins) {
+    plan.nextReheatMins = solarInMins;
+    plan.mode = "IMMERSION";
+    plan.immMins = immMins;
+    plan.note = "IMM " + immMins + "m";
+    S.plan = plan;
+    return;
+  }
+
+  if (agileInMins !== null && agileInMins <= latestSafeStart && agileInMins <= CFG.planner.horizonMins) {
+    plan.nextReheatMins = agileInMins;
+    plan.mode = "HP";
+    plan.hpMins = hpMins;
+    plan.note = "HP " + hpMins + "m";
+    S.plan = plan;
+    return;
+  }
+
+  if (minsToReserve >= CFG.planner.horizonMins && immediateNeededKwh <= 0.05) {
+    S.plan = plan;
+    return;
+  }
+
+  plan.nextReheatMins = latestSafeStart;
+  plan.mode = "HP";
+  plan.hpMins = hpMins;
+  plan.note = "HP " + hpMins + "m";
+  S.plan = plan;
+}
+
+// =====================================================
+// EXTERNAL FETCHERS
+// =====================================================
+function buildSolarUrl() {
+  return "https://api.open-meteo.com/v1/forecast" +
+    "?latitude=" + CFG.solar.lat +
+    "&longitude=" + CFG.solar.lon +
+    "&hourly=shortwave_radiation,cloud_cover,precipitation_probability" +
+    "&forecast_hours=" + CFG.solar.forecastHours +
+    "&timeformat=unixtime";
+}
+
+function buildAgileUrl() {
+  let from = (new Date()).toISOString();
+  let to = (new Date(nowEpochMs() + CFG.agile.lookaheadHours * 3600000)).toISOString();
+  return appendQuery(CFG.agile.endpoint, "period_from=" + encodeURIComponent(from) + "&period_to=" + encodeURIComponent(to));
+}
+
+function parseSolarResponse(obj) {
+  if (!obj || !obj.hourly) return false;
+
+  let t = obj.hourly.time;
+  let sw = obj.hourly.shortwave_radiation;
+  let cc = obj.hourly.cloud_cover;
+  let pp = obj.hourly.precipitation_probability;
+  if (!t || !sw || !cc || !pp) return false;
+
+  let n = Math.min(t.length, sw.length, cc.length, pp.length);
+  if (n < 6) return false;
+
+  let scores = [];
+  for (let i = 0; i < n; i++) {
+    let swN = clamp(sw[i] / 800.0, 0, 1);
+    let cloud = clamp(cc[i] / 100.0, 0, 1);
+    let rainP = clamp(pp[i] / 100.0, 0, 1);
+
+    if (pp[i] >= CFG.solar.maxPrecipProbPct) {
+      scores.push(0);
+      continue;
+    }
+
+    let score = swN * (1 - 0.85 * cloud) * (1 - 0.60 * rainP);
+    scores.push(clamp(score, 0, 1));
+  }
+
+  let minLen = Math.max(1, CFG.solar.minWindowHours);
+  let bestStart = -1, bestEnd = -1, bestScore = 0;
+
+  for (let i = 0; i <= n - minLen; i++) {
+    for (let len = minLen; len <= Math.min(n - i, 8); len++) {
+      let sum = 0;
+      for (let j = 0; j < len; j++) sum += scores[i + j];
+      let avg = sum / len;
+      if (avg >= CFG.solar.scoreThreshold && avg > bestScore) {
+        bestScore = avg;
+        bestStart = i;
+        bestEnd = i + len - 1;
+      }
+    }
+  }
+
+  S.solar.ok = true;
+  S.solar.fetchedEpochMs = nowEpochMs();
+
+  if (bestStart < 0) {
+    S.solar.bestStartEpochMs = 0;
+    S.solar.bestEndEpochMs = 0;
+    S.solar.bestScore = 0;
+    return true;
+  }
+
+  S.solar.bestStartEpochMs = t[bestStart] * 1000;
+  S.solar.bestEndEpochMs = t[bestEnd] * 1000 + 3600000;
+  S.solar.bestScore = bestScore;
+  return true;
+}
+
+function parseAgileResponse(obj) {
+  if (!obj || !obj.results || !obj.results.length) return false;
+
+  let slots = [];
+  for (let i = 0; i < obj.results.length; i++) {
+    let r = obj.results[i];
+    if (!r || !r.valid_from || !r.valid_to) continue;
+
+    let p = isNum(r.value_inc_vat) ? r.value_inc_vat : (isNum(r.value_exc_vat) ? r.value_exc_vat : null);
+    if (p === null) continue;
+
+    let fromE = Date.parse(r.valid_from);
+    let toE = Date.parse(r.valid_to);
+    if (!isEpochSane(fromE) || !isEpochSane(toE)) continue;
+
+    slots.push({ fromEpochMs: fromE, toEpochMs: toE, priceIncVat: p });
+  }
+
+  if (!slots.length) return false;
+  S.agile.ok = true;
+  S.agile.fetchedEpochMs = nowEpochMs();
+  S.agile.slots = slots;
+  return true;
+}
+
+// =====================================================
+// HTTP CALLBACK
+// =====================================================
+function onHttp(result, error_code, error_message, userdata) {
+  POLL.busy = false;
+
+  if (error_code !== 0 || !result || result.code !== 200 || !result.body) {
+    errSet("http_" + userdata.name, "HTTP fail " + userdata.name + " (" + error_code + ")", 2);
+    return;
+  }
+
+  let obj = null;
+  try {
+    obj = JSON.parse(result.body);
+  } catch (e) {
+    errSet("json_" + userdata.name, "Bad JSON " + userdata.name, 2);
+    return;
+  }
+
+  if (userdata.type === "metric") {
+    let value = getByPath(obj, userdata.path);
+    let kind = userdata.kind;
+
+    if (kind === "number") {
+      value = parseNumValue(value);
+      if (value === null) {
+        errSet("bad_" + userdata.name, "BAD " + userdata.name, 1);
+        return;
+      }
+    } else if (kind === "bool") {
+      value = parseBoolValue(value, userdata.invert);
+      if (value === null) {
+        errSet("bad_" + userdata.name, "BAD " + userdata.name, 1);
+        return;
+      }
+    }
+
+    errClear("http_" + userdata.name);
+    errClear("json_" + userdata.name);
+    errClear("bad_" + userdata.name);
+
+    if (userdata.name === "hpPowerW") {
+      S.hpPowerW = value;
+    } else if (userdata.name === "dhwMode") {
+      S.dhwMode = value;
+    } else if (userdata.name === "tankDemand") {
+      S.tankDemand = value;
+    } else if (userdata.name === "immersionOn") {
+      S.immersionOn = value;
+    } else if (userdata.name === "immersionPowerW") {
+      S.immersionPowerW = value;
+    } else if (userdata.name === "showerPowerW") {
+      S.showerPowerW = value;
+    } else if (userdata.name === "feedC") {
+      S.feedC = value;
+    } else if (userdata.name === "topC") {
+      S.topC = value;
+    }
+
+    markSeen(userdata.name);
+    return;
+  }
+
+  if (userdata.type === "solar") {
+    if (parseSolarResponse(obj)) {
+      markSeen("solar");
+      errClear("http_solar");
+      errClear("json_solar");
+      errClear("solar_parse");
+    } else {
+      errSet("solar_parse", "SOLAR parse failed", 1);
+    }
+    return;
+  }
+
+  if (userdata.type === "agile") {
+    if (parseAgileResponse(obj)) {
+      markSeen("agile");
+      errClear("http_agile");
+      errClear("json_agile");
+      errClear("agile_parse");
+    } else {
+      errSet("agile_parse", "AGILE parse failed", 1);
+    }
+  }
+}
+
+// =====================================================
+// FETCH HELPERS
+// =====================================================
+function fetchMetric(name) {
+  let m = CFG.remote[name];
+  if (!m || !m.url || !m.path) return;
+  if (POLL.busy || PERSIST.inFlight) return;
+
+  POLL.busy = true;
+  let timeout = (name === "feedC" || name === "topC") ? 10 : 5;
+  Shelly.call("HTTP.GET", { url: m.url, timeout: timeout }, onHttp,
+    { type: "metric", name: name, path: m.path, invert: !!m.invert, kind: m.kind });
+}
+
+function fetchSolar() {
+  if (!CFG.solar.enabled || POLL.busy || PERSIST.inFlight) return;
+  POLL.busy = true;
+  Shelly.call("HTTP.GET", { url: buildSolarUrl(), timeout: 10 }, onHttp, { type: "solar", name: "solar" });
+}
+
+function fetchAgile() {
+  if (!CFG.agile.enabled || POLL.busy || PERSIST.inFlight) return;
+  POLL.busy = true;
+  Shelly.call("HTTP.GET", { url: buildAgileUrl(), timeout: 10 }, onHttp, { type: "agile", name: "agile" });
+}
+
+// PART 4 OF 4
+// =====================================================
+// STALENESS => PRESENT ERRORS
+// =====================================================
+function updateStaleErrors() {
+  if (Shelly.getUptimeMs() < CFG.stale.bootGraceMs) return;
+
+  let fast = ["hpPowerW", "dhwMode", "tankDemand", "immersionOn", "immersionPowerW", "showerPowerW"];
+  for (let i = 0; i < fast.length; i++) {
+    let n = fast[i];
+    if (isMetricStale(n, CFG.stale.fastMs)) errSet("stale_" + n, "STALE " + n, 1);
+    else errClear("stale_" + n);
+  }
+
+  let temps = ["feedC", "topC"];
+  for (let j = 0; j < temps.length; j++) {
+    let t = temps[j];
+    if (isMetricStale(t, CFG.stale.tempMs)) errSet("stale_" + t, "STALE " + t, 1);
+    else errClear("stale_" + t);
+  }
+
+  if (CFG.solar.enabled) {
+    if (isMetricStale("solar", CFG.stale.externalMs)) errSet("stale_solar", "STALE solar", 1);
+    else errClear("stale_solar");
+  }
+
+  if (CFG.agile.enabled) {
+    if (isMetricStale("agile", CFG.stale.externalMs)) errSet("stale_agile", "STALE agile", 1);
+    else errClear("stale_agile");
+  }
+}
+
+// =====================================================
+// PERSISTENCE
+// =====================================================
+function markPersistDirty() {
+  PERSIST.dirty = true;
+}
+
+function persistSnapshotV3() {
+  return {
+    v: 3,
+    t: S.lastUpdateEpochMs,
+    st: S.lastSatisfiedEpochMs,
+    u: round2(S.upperKwh),
+    l: round2(S.lowerKwh),
+    hp: round2(S.learnHpKW),
+    sb: round2(S.learnStandbyMul),
+    sh: round2(S.learnShowerMul),
+    cc: S.calibrationCount,
+    mae: round2(S.meanAbsCalErrorKwh)
+  };
+}
+
+function applyPersistedSnapshot(obj) {
+  if (!obj || typeof obj !== "object") return;
+
+  if (isNum(obj.learnHpKW)) S.learnHpKW = clamp(obj.learnHpKW, CFG.learning.hpMinKW, CFG.learning.hpMaxKW);
+  if (isNum(obj.learnStandbyMul)) S.learnStandbyMul = clamp(obj.learnStandbyMul, CFG.learning.standbyMinMul, CFG.learning.standbyMaxMul);
+  if (isNum(obj.learnShowerMul)) S.learnShowerMul = clamp(obj.learnShowerMul, CFG.learning.showerMinMul, CFG.learning.showerMaxMul);
+  if (isNum(obj.calibrationCount)) S.calibrationCount = Math.max(0, Math.floor(obj.calibrationCount));
+  if (isNum(obj.meanAbsCalErrorKwh)) S.meanAbsCalErrorKwh = Math.max(0, obj.meanAbsCalErrorKwh);
+
+  if (isNum(obj.hp)) S.learnHpKW = clamp(obj.hp, CFG.learning.hpMinKW, CFG.learning.hpMaxKW);
+  if (isNum(obj.sb)) S.learnStandbyMul = clamp(obj.sb, CFG.learning.standbyMinMul, CFG.learning.standbyMaxMul);
+  if (isNum(obj.sh)) S.learnShowerMul = clamp(obj.sh, CFG.learning.showerMinMul, CFG.learning.showerMaxMul);
+  if (isNum(obj.cc)) S.calibrationCount = Math.max(0, Math.floor(obj.cc));
+  if (isNum(obj.mae)) S.meanAbsCalErrorKwh = Math.max(0, obj.mae);
+
+  if (isNum(obj.u)) S.upperKwh = Math.max(0, obj.u);
+  if (isNum(obj.l)) S.lowerKwh = Math.max(0, obj.l);
+  if (isNum(obj.t)) S.lastUpdateEpochMs = obj.t;
+  if (isNum(obj.st)) S.lastSatisfiedEpochMs = obj.st;
+
+  clampLayers();
+}
+
+function completeLoad() {
+  if (PERSIST.loaded) return;
+  applyOfflineLossIfNeeded();
+  PERSIST.loaded = true;
+  markPersistDirty();
+  refreshVirtuals();
+  flushPersistedModel(true);
+}
+
+function onKvsGetV1(result, error_code, error_message) {
+  if (error_code === -105) {
+    setFullAtStatTemp();
+    errClear("kvs_get");
+    errClear("kvs_parse");
+    completeLoad();
+    return;
+  }
+
+  if (error_code !== 0) {
+    errSet("kvs_get", "KVS.Get v1 failed (" + error_code + ")", 2);
+    setFullAtStatTemp();
+    completeLoad();
+    return;
+  }
+
+  let raw = (result && typeof result.value !== "undefined") ? result.value : result;
+  try {
+    let obj = (typeof raw === "string") ? JSON.parse(raw) : raw;
+    applyPersistedSnapshot(obj);
+    if (!isNum(obj.u) || !isNum(obj.l)) setFullAtStatTemp();
+    errClear("kvs_get");
+    errClear("kvs_parse");
+    completeLoad();
+  } catch (e) {
+    errSet("kvs_parse", "KVS parse error", 2);
+    setFullAtStatTemp();
+    completeLoad();
+  }
+}
+
+function onKvsGetV2(result, error_code, error_message) {
+  if (error_code === -105) {
+    Shelly.call("KVS.Get", { key: CFG.persist.keyV1Fallback }, onKvsGetV1);
+    return;
+  }
+
+  if (error_code !== 0) {
+    errSet("kvs_get", "KVS.Get v2 failed (" + error_code + ")", 2);
+    setFullAtStatTemp();
+    completeLoad();
+    return;
+  }
+
+  let raw = (result && typeof result.value !== "undefined") ? result.value : result;
+  try {
+    let obj = (typeof raw === "string") ? JSON.parse(raw) : raw;
+    applyPersistedSnapshot(obj);
+    PERSIST.lastSaveJson = (typeof raw === "string") ? raw : JSON.stringify(obj);
+    errClear("kvs_get");
+    errClear("kvs_parse");
+    completeLoad();
+  } catch (e) {
+    errSet("kvs_parse", "KVS parse error", 2);
+    setFullAtStatTemp();
+    completeLoad();
+  }
+}
+
+function onKvsGetV3(result, error_code, error_message) {
+  PERSIST.inFlight = false;
+
+  if (error_code === -105) {
+    Shelly.call("KVS.Get", { key: CFG.persist.keyV2Fallback }, onKvsGetV2);
+    return;
+  }
+
+  if (error_code !== 0) {
+    errSet("kvs_get", "KVS.Get failed (" + error_code + ")", 2);
+    setFullAtStatTemp();
+    completeLoad();
+    return;
+  }
+
+  let raw = (result && typeof result.value !== "undefined") ? result.value : result;
+  try {
+    let obj = (typeof raw === "string") ? JSON.parse(raw) : raw;
+    applyPersistedSnapshot(obj);
+    PERSIST.lastSaveJson = (typeof raw === "string") ? raw : JSON.stringify(obj);
+    errClear("kvs_get");
+    errClear("kvs_parse");
+    completeLoad();
+  } catch (e) {
+    errSet("kvs_parse", "KVS parse error", 2);
+    setFullAtStatTemp();
+    completeLoad();
+  }
+}
+
+function loadPersistedModel() {
+  if (PERSIST.inFlight || PERSIST.loaded) return;
+  PERSIST.inFlight = true;
+  Shelly.call("KVS.Get", { key: CFG.persist.keyV3 }, onKvsGetV3);
+}
+
+function flushPersistedModel(force) {
+  let nowU = Shelly.getUptimeMs();
+  if (!PERSIST.loaded && !force) return;
+  if (!PERSIST.dirty && !force) return;
+  if (PERSIST.inFlight) return;
+  if (!force && (nowU - PERSIST.lastFlushUptimeMs) < CFG.persist.minFlushGapMs) return;
+
+  S.lastUpdateEpochMs = nowEpochMs();
+  let json = JSON.stringify(persistSnapshotV3());
+
+  if (!force && json === PERSIST.lastSaveJson) {
+    PERSIST.dirty = false;
+    return;
+  }
+
+  PERSIST.inFlight = true;
+  Shelly.call("KVS.Set", { key: CFG.persist.keyV3, value: json }, function(res, ec, em) {
+    PERSIST.inFlight = false;
+    if (ec !== 0) {
+      errSet("kvs_set", "KVS.Set failed (" + ec + ")", 2);
+      return;
+    }
+    errClear("kvs_set");
+    PERSIST.lastSaveJson = json;
+    PERSIST.lastFlushUptimeMs = Shelly.getUptimeMs();
+    PERSIST.dirty = false;
+  });
+}
+
+function applyOfflineLossIfNeeded() {
+  if (!isEpochSane(S.lastUpdateEpochMs)) return;
+
+  let dtHours = (nowEpochMs() - S.lastUpdateEpochMs) / 3600000.0;
+  if (!isNum(dtHours) || dtHours <= 0.02) return;
+  dtHours = Math.min(dtHours, CFG.persist.maxOfflineHours);
+
+  while (dtHours > 0) {
+    let h = Math.min(1.0, dtHours);
+    let avgTempC = avgTempFromEnergy(S.energyKwh);
+    let standby = (standingLossPerDayBase(avgTempC) * S.learnStandbyMul / 24.0) * h;
+    applyStandingLoss(standby);
+    dtHours -= h;
+  }
+}
+
+// =====================================================
+// MAIN TICKS
+// =====================================================
+function modelTick() {
+  if (!PERSIST.loaded) return;
+
+  let nowU = Shelly.getUptimeMs();
+  if (!S.lastModelTickUptimeMs) {
+    S.lastModelTickUptimeMs = nowU;
+    return;
+  }
+
+  let dtMs = nowU - S.lastModelTickUptimeMs;
+  if (dtMs <= 0) return;
+
+  if (!isMetricStale("hpPowerW", CFG.stale.fastMs) && isNum(S.hpPowerW)) {
+    if (!S.hpOn && S.hpPowerW >= CFG.hpOnW) S.hpOn = true;
+    else if (S.hpOn && S.hpPowerW <= CFG.hpOffW) S.hpOn = false;
+  } else {
     S.hpOn = false;
   }
 
-  // Immersion heating state from actual power
+  S.showerRunning = computeShowerRunning();
+
+  if (S.showerRunning && !S.session.active) {
+    startShowerSession();
+  }
+
+  if (!S.showerRunning && S.session.active && (nowU - S.session.lastFlowUptimeMs) >= CFG.showerSessionGapMs) {
+    finalizeShowerSession();
+  }
+
+  S.hpChargingNow = computeHpChargingNow();
   S.immersionHeatingNow = computeImmersionHeatingNow();
 
-  // Detect "immersion enabled but thermostat cut power" => top is 65 C
-  if (S.immersionOn) {
-    if (isNum(S.immersionPowerW) && S.immersionPowerW < CFG.immersionLowPowerW) {
-      if (!S.immersionLowPowerStartMs) {
-        S.immersionLowPowerStartMs = nowU;
-      } else if (!S.immersionTopConfirmedThisRun &&
-                 (nowU - S.immersionLowPowerStartMs) >= CFG.immersionLowPowerHoldMs) {
-        correctUpperFromImmersionThermostat65();
+  if (S.session.active && S.showerRunning && S.session.runtimeMs >= CFG.reliableTopAfterRunMs && isNum(S.topC)) {
+    S.session.reliableTopC = S.topC;
+  }
+
+  if (S.immersionOn && !isMetricStale("immersionPowerW", CFG.stale.fastMs) && isNum(S.immersionPowerW)) {
+    if (S.immersionPowerW < CFG.immersionLowPowerW) {
+      if (!S.immersionLowPowerStartMs) S.immersionLowPowerStartMs = nowU;
+      else if (!S.immersionTopConfirmedThisRun && (nowU - S.immersionLowPowerStartMs) >= CFG.immersionLowPowerHoldMs) {
+        let targetUpper = upperCapAtTemp(65);
+        if (S.upperKwh < targetUpper) {
+          S.upperKwh = targetUpper;
+          clampLayers();
+        }
         S.immersionTopConfirmedThisRun = true;
       }
     } else {
@@ -1042,134 +1486,56 @@ function applyTransitions() {
     S.immersionTopConfirmedThisRun = false;
   }
 
-  // Shower hysteresis
-  if (!S.showerRunning && isNum(S.showerPowerW) && S.showerPowerW >= CFG.showerOnW) {
-    S.showerRunning = true;
-    startShowerSession();
-  } else if (S.showerRunning && isNum(S.showerPowerW) && S.showerPowerW <= CFG.showerOffW) {
-    S.showerRunning = false;
-  }
+  integrateModel(dtMs);
+  updateTapDetection(dtMs);
 
-  // Close grouped shower session after gap timeout
-  if (S.session.active && !S.showerRunning) {
-    if ((nowU - S.session.lastFlowUptimeMs) >= CFG.showerSessionGapMs) {
-      finalizeShowerSession();
-    }
-  }
-
-  // Charge tracking
   let chargeActive = currentChargeActive();
+  if (S.prevChargeActive === null) S.prevChargeActive = chargeActive;
+  if (S.prevTankDemand === null) S.prevTankDemand = S.tankDemand;
+
   if (!S.prevChargeActive && chargeActive) {
     S.chargeSatisfiedThisRun = false;
   }
 
-  // Full calibration when demand drops during an active charge
-  let chargingContext = S.immersionOn || (S.hpOn && S.dhwMode);
-  if (S.prevTankDemand && !S.tankDemand && chargingContext) {
+  let tankDemandFresh = !isMetricStale("tankDemand", CFG.stale.fastMs);
+  let demandDropped = tankDemandFresh && S.prevTankDemand === true && S.tankDemand === false;
+  if (demandDropped && chargeActive) {
     snapTankToFull();
   }
 
-  // Count a partial charge if a charge ended without satisfaction
   if (S.prevChargeActive && !chargeActive && !S.chargeSatisfiedThisRun) {
     S.partialChargeCountSinceFull += 1;
   }
 
   S.prevTankDemand = S.tankDemand;
   S.prevChargeActive = chargeActive;
-}
 
-// --------------------
-// HTTP POLLING
-// --------------------
-function onMetric(result, error_code, error_message, userdata) {
-  POLL.busy = false;
-
-  if (error_code !== 0 || !result || result.code !== 200 || !result.body) {
-    print("HTTP failed:", userdata.name, "err:", error_code, "msg:", error_message);
-    return;
-  }
-
-  let obj;
-  try {
-    obj = JSON.parse(result.body);
-  } catch (e) {
-    print("Bad JSON:", userdata.name);
-    return;
-  }
-
-  let value = getByPath(obj, userdata.path);
-
-  integrate();
-
-  if (userdata.name === "hpPowerW") {
-    S.hpPowerW = isNum(value) ? value : 0;
-    markSeen("hpPowerW");
-  } else if (userdata.name === "dhwMode") {
-    S.dhwMode = boolValue(value, userdata.invert);
-    markSeen("dhwMode");
-  } else if (userdata.name === "tankDemand") {
-    S.tankDemand = boolValue(value, userdata.invert);
-    markSeen("tankDemand");
-  } else if (userdata.name === "immersionOn") {
-    S.immersionOn = boolValue(value, userdata.invert);
-    markSeen("immersionOn");
-  } else if (userdata.name === "immersionPowerW") {
-    S.immersionPowerW = isNum(value) ? value : 0;
-    markSeen("immersionPowerW");
-  } else if (userdata.name === "showerPowerW") {
-    S.showerPowerW = isNum(value) ? value : 0;
-    markSeen("showerPowerW");
-  } else if (userdata.name === "feedC") {
-    if (isNum(value)) {
-      S.feedC = value;
-      markSeen("feedC");
-    }
-  } else if (userdata.name === "topC") {
-    if (isNum(value)) {
-      S.topC = value;
-      markSeen("topC");
-
-      // During a shower session, once total running-water time has reached 4 min,
-      // treat the top reading as reliable top-of-cylinder temp
-      if (S.session.active &&
-          S.showerRunning &&
-          S.session.runtimeMs >= CFG.reliableTopAfterRunMs) {
-        S.session.reliableTopC = value;
-        S.session.reliableTopCaptured = true;
-      }
-    }
-  }
-
-  applyTransitions();
-  refreshVirtuals();
-}
-
-function fetchMetric(name) {
-  let m = CFG.remote[name];
-  if (!m || !m.url || !m.path) return;
-  if (POLL.busy) return;
-
-  POLL.busy = true;
-
-  let timeout = (name === "feedC" || name === "topC") ? 10 : 5;
-
-  Shelly.call(
-    "HTTP.GET",
-    { url: m.url, timeout: timeout },
-    onMetric,
-    { name: name, path: m.path, invert: !!m.invert }
-  );
-}
-
-function pollOne() {
-  integrate();
+  updateStaleErrors();
+  computeReheatPlan();
   refreshVirtuals();
 
-  if (POLL.busy || PERSIST.inFlight) return;
+  S.lastModelTickUptimeMs = nowU;
+  markPersistDirty();
+}
+
+function pollTick() {
+  if (POLL.busy || PERSIST.inFlight || !PERSIST.loaded) return;
 
   POLL.tick++;
+  let nowU = Shelly.getUptimeMs();
 
-  // Poll temperatures every 15 seconds, alternating feed/top
+  if (CFG.solar.enabled && (!EXT.nextSolarUptimeMs || nowU >= EXT.nextSolarUptimeMs)) {
+    EXT.nextSolarUptimeMs = nowU + EXT.solarEveryMs;
+    fetchSolar();
+    return;
+  }
+
+  if (CFG.agile.enabled && (!EXT.nextAgileUptimeMs || nowU >= EXT.nextAgileUptimeMs)) {
+    EXT.nextAgileUptimeMs = nowU + EXT.agileEveryMs;
+    fetchAgile();
+    return;
+  }
+
   if (POLL.tick % 15 === 0) {
     let tname = POLL.tempList[POLL.tempIndex];
     POLL.tempIndex = (POLL.tempIndex + 1) % POLL.tempList.length;
@@ -1177,7 +1543,6 @@ function pollOne() {
     return;
   }
 
-  // Poll fast metrics all other seconds
   let fname = POLL.fastList[POLL.fastIndex];
   POLL.fastIndex = (POLL.fastIndex + 1) % POLL.fastList.length;
   fetchMetric(fname);
@@ -1187,25 +1552,15 @@ function persistTick() {
   flushPersistedModel(false);
 }
 
-// --------------------
+// =====================================================
 // BOOT
-// --------------------
+// =====================================================
 function init() {
-  setFullAtStatTemp();
-  S.lastFullChargeC = CFG.statTempC;
-  S.lastTickMs = Shelly.getUptimeMs();
-
-  resetCycleLearning();
-  updateForecast();
   refreshVirtuals();
-
-  // Seed KVS on first boot if empty
-  Timer.set(3000, false, function () {
-    flushPersistedModel(true);
-  });
+  Timer.set(1000, true, pollTick);
+  Timer.set(1000, true, modelTick);
+  Timer.set(15000, true, persistTick);
+  loadPersistedModel();
 }
 
 init();
-loadPersistedModel();
-Timer.set(1000, true, pollOne);
-Timer.set(15000, true, persistTick);
