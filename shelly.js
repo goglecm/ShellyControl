@@ -971,8 +971,16 @@ function computeReheatPlan() {
   let agileBestSlot = null;
   let agileNextSlot = null;
   let agileDeadlineEpochMs = nowE + latestSafeStart * 60000;
+  let diagFragments = [];
+  let solarFresh = !isMetricStale("solar", CFG.stale.externalMs);
+  let agileFresh = !isMetricStale("agile", CFG.stale.externalMs);
+  let solarUsable = CFG.solar.enabled && S.solar.ok === true && solarFresh;
+  let agileUsable = CFG.agile.enabled && S.agile.ok === true && agileFresh;
 
-  if (CFG.solar.enabled && S.solar.ok && S.solar.candidates && S.solar.candidates.length > 0) {
+  if (CFG.solar.enabled && !solarFresh) diagFragments.push("SOLAR_STALE");
+  if (CFG.agile.enabled && !agileFresh) diagFragments.push("AGILE_STALE");
+
+  if (solarUsable && S.solar.candidates && S.solar.candidates.length > 0) {
     let solarEligible = [];
     for (let i = 0; i < S.solar.candidates.length; i++) {
       let c = S.solar.candidates[i];
@@ -992,7 +1000,7 @@ function computeReheatPlan() {
     }
   }
 
-  if (CFG.agile.enabled && S.agile.ok && S.agile.slots.length > 0) {
+  if (agileUsable && S.agile.slots.length > 0) {
     for (let i = 0; i < S.agile.slots.length; i++) {
       let slot = S.agile.slots[i];
       if (!slot || !isNum(slot.fromEpochMs)) continue;
@@ -1019,6 +1027,7 @@ function computeReheatPlan() {
 
   function decoratePlanNote() {
     let summary = agileSummary(plan.agileBestSlot, plan.agileNextSlot);
+    if (diagFragments.length > 0) plan.note = plan.note + " | " + diagFragments.join(",");
     if (summary) plan.note = plan.note + " | " + summary;
   }
 
@@ -1293,13 +1302,17 @@ function updateStaleErrors() {
   }
 
   if (CFG.solar.enabled) {
-    if (isMetricStale("solar", CFG.stale.externalMs)) errSet("stale_solar", "STALE solar", 1);
-    else errClear("stale_solar");
+    if (isMetricStale("solar", CFG.stale.externalMs)) {
+      errSet("stale_solar", "STALE solar", 1);
+      S.solar.ok = false;
+    } else errClear("stale_solar");
   }
 
   if (CFG.agile.enabled) {
-    if (isMetricStale("agile", CFG.stale.externalMs)) errSet("stale_agile", "STALE agile", 1);
-    else errClear("stale_agile");
+    if (isMetricStale("agile", CFG.stale.externalMs)) {
+      errSet("stale_agile", "STALE agile", 1);
+      S.agile.ok = false;
+    } else errClear("stale_agile");
   }
 }
 
