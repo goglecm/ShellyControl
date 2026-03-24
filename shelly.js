@@ -339,6 +339,29 @@ function clamp(x, lo, hi) {
   return x;
 }
 
+function fmtHHMM(epochMs) {
+  let d = new Date(epochMs);
+  let hh = d.getHours();
+  let mm = d.getMinutes();
+  return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm;
+}
+
+function fmtPence(priceIncVat) {
+  return round1(priceIncVat) + "p";
+}
+
+function agileSummary(bestSlot, nextSlot) {
+  let parts = [];
+  if (bestSlot && isNum(bestSlot.fromEpochMs) && isNum(bestSlot.priceIncVat)) {
+    parts.push("AGILE best " + fmtHHMM(bestSlot.fromEpochMs) + " @ " + fmtPence(bestSlot.priceIncVat));
+  }
+  if (nextSlot && isNum(nextSlot.fromEpochMs)) {
+    let nextPrice = isNum(nextSlot.priceIncVat) ? fmtPence(nextSlot.priceIncVat) : "n/a";
+    parts.push("next " + fmtHHMM(nextSlot.fromEpochMs) + " @ " + nextPrice);
+  }
+  return parts.join("; ");
+}
+
 function round1(x) { return Math.round(x * 10) / 10; }
 function round2(x) { return Math.round(x * 100) / 100; }
 function nowEpochMs() { return (new Date()).getTime(); }
@@ -902,6 +925,7 @@ function computeReheatPlan() {
   let futureRefillKwh = Math.max(0, targetKwh - reserveKwh);
   let planKwh = immediateNeededKwh > 0.05 ? immediateNeededKwh : futureRefillKwh;
   let minsToReserve = computeTimeToReserveMins(reserveKwh);
+  let latestSafeStart = Math.max(0, minsToReserve - CFG.planner.minLeadMins);
 
   let plan = {
     nextReheatMins: minsToReserve,
@@ -910,7 +934,9 @@ function computeReheatPlan() {
     immMins: 0,
     reason: "NONE",
     reasonDetail: "HOLD",
-    note: "HOLD"
+    note: "HOLD",
+    agileBestSlot: null,
+    agileNextSlot: null
   };
 
   if (planKwh <= 0.05) {
@@ -943,6 +969,9 @@ function computeReheatPlan() {
   let nowE = nowEpochMs();
   let solarInMins = null;
   let agileInMins = null;
+  let agileBestSlot = null;
+  let agileNextSlot = null;
+  let agileDeadlineEpochMs = nowE + latestSafeStart * 60000;
 
   if (CFG.solar.enabled && S.solar.ok && isEpochSane(S.solar.bestStartEpochMs)) {
     let dt = S.solar.bestStartEpochMs - nowE;
@@ -950,19 +979,34 @@ function computeReheatPlan() {
   }
 
   if (CFG.agile.enabled && S.agile.ok && S.agile.slots.length > 0) {
-    let best = null;
     for (let i = 0; i < S.agile.slots.length; i++) {
       let slot = S.agile.slots[i];
-      if (!slot || !isNum(slot.priceIncVat) || slot.fromEpochMs < nowE) continue;
-      if (!best || slot.priceIncVat < best.priceIncVat ||
-          (slot.priceIncVat === best.priceIncVat && slot.fromEpochMs < best.fromEpochMs)) {
-        best = slot;
+      if (!slot || !isNum(slot.fromEpochMs)) continue;
+
+      if (slot.fromEpochMs >= nowE) {
+        if (!agileNextSlot || slot.fromEpochMs < agileNextSlot.fromEpochMs) {
+          agileNextSlot = slot;
+        }
+      }
+
+      if (!isNum(slot.priceIncVat)) continue;
+      if (slot.fromEpochMs < nowE || slot.fromEpochMs > agileDeadlineEpochMs) continue;
+
+      if (!agileBestSlot || slot.priceIncVat < agileBestSlot.priceIncVat ||
+          (slot.priceIncVat === agileBestSlot.priceIncVat && slot.fromEpochMs < agileBestSlot.fromEpochMs)) {
+        agileBestSlot = slot;
       }
     }
-    if (best) agileInMins = Math.floor((best.fromEpochMs - nowE) / 60000);
+    if (agileBestSlot) agileInMins = Math.floor((agileBestSlot.fromEpochMs - nowE) / 60000);
   }
 
-  let latestSafeStart = Math.max(0, minsToReserve - CFG.planner.minLeadMins);
+  plan.agileBestSlot = agileBestSlot;
+  plan.agileNextSlot = agileNextSlot;
+
+  function decoratePlanNote() {
+    let summary = agileSummary(plan.agileBestSlot, plan.agileNextSlot);
+    if (summary) plan.note = plan.note + " | " + summary;
+  }
 
   if (solarInMins !== null && solarInMins <= latestSafeStart && solarInMins <= CFG.planner.horizonMins) {
     plan.nextReheatMins = solarInMins;
@@ -971,6 +1015,7 @@ function computeReheatPlan() {
     plan.reason = "SOLAR_WINDOW";
     plan.reasonDetail = "IMM " + immMins + "m";
     plan.note = plan.reasonDetail + " [" + plan.reason + "]";
+    decoratePlanNote();
     S.plan = plan;
     return;
   }
@@ -982,6 +1027,7 @@ function computeReheatPlan() {
     plan.reason = "AGILE_PRICE";
     plan.reasonDetail = "HP " + hpMins + "m";
     plan.note = plan.reasonDetail + " [" + plan.reason + "]";
+    decoratePlanNote();
     S.plan = plan;
     return;
   }
@@ -995,8 +1041,9 @@ function computeReheatPlan() {
   plan.mode = "HP";
   plan.hpMins = hpMins;
   plan.reason = "RESERVE_DEADLINE";
-  plan.reasonDetail = "HP " + hpMins + "m";
+  plan.reasonDetail = "HP " + hpMins + "m (no AGILE <= deadline)";
   plan.note = plan.reasonDetail + " [" + plan.reason + "]";
+  decoratePlanNote();
   S.plan = plan;
 }
 
