@@ -296,6 +296,8 @@ let S = {
     mode: "NONE",
     hpMins: 0,
     immMins: 0,
+    reason: "NONE",
+    reasonDetail: "HOLD",
     note: "NONE"
   }
 };
@@ -906,6 +908,8 @@ function computeReheatPlan() {
     mode: "NONE",
     hpMins: 0,
     immMins: 0,
+    reason: "NONE",
+    reasonDetail: "HOLD",
     note: "HOLD"
   };
 
@@ -919,15 +923,18 @@ function computeReheatPlan() {
 
   if (mins <= CFG.planner.urgentMins42 || minsToReserve <= CFG.planner.minLeadMins) {
     plan.nextReheatMins = 0;
+    plan.reason = mins <= CFG.planner.urgentMins42 ? "URGENT_LOW_MINS" : "URGENT_RESERVE_LEAD";
     if (mins <= 3) {
       plan.mode = "HP+IMM";
       plan.hpMins = hpMins;
       plan.immMins = immMins;
-      plan.note = "HP+IMM UNTIL SAT";
+      plan.reasonDetail = "HP+IMM UNTIL SAT";
+      plan.note = plan.reasonDetail + " [" + plan.reason + "]";
     } else {
       plan.mode = "HP";
       plan.hpMins = hpMins;
-      plan.note = "HP " + hpMins + "m";
+      plan.reasonDetail = "HP " + hpMins + "m";
+      plan.note = plan.reasonDetail + " [" + plan.reason + "]";
     }
     S.plan = plan;
     return;
@@ -961,7 +968,9 @@ function computeReheatPlan() {
     plan.nextReheatMins = solarInMins;
     plan.mode = "IMMERSION";
     plan.immMins = immMins;
-    plan.note = "IMM " + immMins + "m";
+    plan.reason = "SOLAR_WINDOW";
+    plan.reasonDetail = "IMM " + immMins + "m";
+    plan.note = plan.reasonDetail + " [" + plan.reason + "]";
     S.plan = plan;
     return;
   }
@@ -970,7 +979,9 @@ function computeReheatPlan() {
     plan.nextReheatMins = agileInMins;
     plan.mode = "HP";
     plan.hpMins = hpMins;
-    plan.note = "HP " + hpMins + "m";
+    plan.reason = "AGILE_PRICE";
+    plan.reasonDetail = "HP " + hpMins + "m";
+    plan.note = plan.reasonDetail + " [" + plan.reason + "]";
     S.plan = plan;
     return;
   }
@@ -983,7 +994,9 @@ function computeReheatPlan() {
   plan.nextReheatMins = latestSafeStart;
   plan.mode = "HP";
   plan.hpMins = hpMins;
-  plan.note = "HP " + hpMins + "m";
+  plan.reason = "RESERVE_DEADLINE";
+  plan.reasonDetail = "HP " + hpMins + "m";
+  plan.note = plan.reasonDetail + " [" + plan.reason + "]";
   S.plan = plan;
 }
 
